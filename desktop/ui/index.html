@@ -1,0 +1,104 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Grok Build</title>
+  <link rel="stylesheet" href="style.css" />
+</head>
+<body>
+  <div id="app">
+    <aside id="sidebar">
+      <div class="sidebar-head">
+        <div class="brand">
+          <span class="brand-mark">/</span>
+          <span class="brand-name">Grok Build</span>
+        </div>
+        <button id="new-chat" class="btn btn-primary" title="Start a new chat (new agent session)">
+          + New chat
+        </button>
+      </div>
+      <nav id="chat-list" aria-label="Chats"></nav>
+      <div class="sidebar-foot">
+        <div id="agent-status" class="agent-status">
+          <span class="dot dot-off" id="status-dot"></span>
+          <span id="status-text">agent offline</span>
+        </div>
+      </div>
+    </aside>
+
+    <main id="main">
+      <header id="topbar">
+        <button id="folder-btn" class="chip" title="Project folder for new chats">
+          <span class="chip-icon">📁</span>
+          <span id="folder-label">no folder</span>
+        </button>
+        <span class="chip chip-static" title="Model (set on the Start screen)">
+          <span class="chip-icon">✦</span>
+          <span id="model-label">default model</span>
+        </span>
+        <div class="topbar-spacer"></div>
+        <button id="settings-btn" class="chip" title="Agent settings">⚙ Settings</button>
+      </header>
+
+      <!-- Setup / welcome panel -->
+      <section id="setup" class="panel">
+        <div class="setup-card">
+          <h1><span class="brand-mark big">/</span> Grok Build</h1>
+          <p class="muted">
+            Chat with SpaceXAI's coding agent about a project on this computer.
+            It reads your codebase, edits files, and runs commands — with your
+            approval.
+          </p>
+          <div id="binary-warning" class="warn hidden"></div>
+          <label class="field">
+            <span>Project folder</span>
+            <div class="row">
+              <input id="setup-folder" type="text" placeholder="/path/to/your/project" spellcheck="false" />
+              <button id="setup-browse" class="btn">Browse…</button>
+            </div>
+          </label>
+          <label class="field">
+            <span>Model <span class="muted">(optional, e.g. grok-build)</span></span>
+            <input id="setup-model" type="text" placeholder="default" spellcheck="false" />
+          </label>
+          <label class="check">
+            <input id="setup-yolo" type="checkbox" />
+            <span>Auto-approve tool actions <span class="muted">(no permission prompts — use with care)</span></span>
+          </label>
+          <button id="setup-start" class="btn btn-primary btn-lg">Start</button>
+          <p class="muted small">
+            First time? Sign in by running <code>grok login</code> in a terminal
+            (or set <code>XAI_API_KEY</code>), then press Start.
+          </p>
+        </div>
+      </section>
+
+      <!-- Chat transcript area; one .transcript per chat, swapped on switch -->
+      <section id="chat-area" class="panel hidden">
+        <div id="transcripts"></div>
+        <div id="composer">
+          <div id="composer-inner">
+            <textarea id="prompt-input" rows="1"
+              placeholder="Ask Grok to build, fix, or explain something…"></textarea>
+            <button id="send-btn" class="btn btn-primary" title="Send (Enter)">Send</button>
+            <button id="stop-btn" class="btn btn-danger hidden" title="Stop the current turn">Stop</button>
+          </div>
+          <div id="composer-hint" class="muted small">Enter to send · Shift+Enter for a new line</div>
+        </div>
+      </section>
+    </main>
+  </div>
+
+  <!-- Permission request modal -->
+  <div id="perm-overlay" class="overlay hidden" role="dialog" aria-modal="true">
+    <div class="modal">
+      <h2>Permission request</h2>
+      <div id="perm-body"></div>
+      <div id="perm-options" class="perm-options"></div>
+    </div>
+  </div>
+
+  <script type="module" src="main.js"></script>
+</body>
+</html>
