@@ -1,3 +1,7 @@
 /target
 **/*.rs.bk
 .DS_Store
+/desktop/src-tauri/target
+/desktop/src-tauri/gen
+/desktop/src-tauri/resources/bin/*
+!/desktop/src-tauri/resources/bin/README.md
