@@ -1,7 +1,23 @@
 use anyhow::{Context, bail};
 use std::env;
+use std::fs;
+use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+
+/// True when `path` starts with `#!` (DotSlash / shell wrapper), so Windows
+/// CreateProcess cannot treat it as a PE binary.
+fn looks_like_script(path: &Path) -> bool {
+    let mut file = match fs::File::open(path) {
+        Ok(f) => f,
+        Err(_) => return false,
+    };
+    let mut magic = [0u8; 2];
+    match file.read_exact(&mut magic) {
+        Ok(()) => magic == *b"#!",
+        Err(_) => false,
+    }
+}
 
 fn check_protoc_good(protoc: &Path) -> anyhow::Result<()> {
     let output = Command::new(protoc)
@@ -49,6 +65,9 @@ pub fn find_protoc() -> anyhow::Result<Option<PathBuf>> {
     }
 
     // 2. Walk up directories looking for bin/protoc (dotslash wrapper).
+    //    Skip it on Windows when it looks like a DotSlash/shebang script —
+    //    CreateProcess cannot run those (os error 193), and the failure is
+    //    noisy even though PATH/PROTOC fallback works.
     let cwd = env::current_dir()?;
     let mut dir = cwd.clone();
     let mut dir_rel = PathBuf::new();
@@ -56,6 +75,14 @@ pub fn find_protoc() -> anyhow::Result<Option<PathBuf>> {
         // Return relative path to make build more deterministic.
         let protoc = dir_rel.join("bin/protoc");
         if protoc.try_exists()? {
+            if cfg!(windows) && looks_like_script(&protoc) {
+                eprintln!(
+                    "bin/protoc at `{}` looks like a DotSlash/shebang script; \
+                     skipping on Windows in favor of $PROTOC/PATH",
+                    protoc.display()
+                );
+                break;
+            }
             match check_protoc_good(&protoc) {
                 Ok(()) => return Ok(Some(protoc)),
                 Err(e) => {
