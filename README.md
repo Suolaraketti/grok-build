@@ -91,6 +91,7 @@ MCP servers, skills, plugins, hooks, headless mode, sandboxing, and more.
 | `crates/codegen/xai-grok-workspace` | Host filesystem, VCS, execution, checkpoints |
 | `crates/codegen/...` | The rest of the CLI crate closure (config, MCP, markdown, sandbox, ...) |
 | `crates/common/`, `crates/build/`, `prod/mc/` | Small shared leaf crates pulled in by the closure |
+| `desktop/` | **Grok Build Desktop** — a downloadable Tauri chat GUI over the agent runtime (via ACP); see [`desktop/README.md`](desktop/README.md) |
 | `third_party/` | Vendored upstream source (Mermaid diagram stack) — see below |
 
 > [!IMPORTANT]

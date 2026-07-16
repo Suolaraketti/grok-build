@@ -1,0 +1,37 @@
+# Grok Build Desktop — Tauri shell around the `grok agent stdio` ACP runtime.
+#
+# This crate is intentionally NOT a member of the repository's generated root
+# workspace (the empty [workspace] table below opts it out), so it can be
+# built independently with its own dependency tree:
+#
+#   cd desktop/src-tauri && cargo build --release
+
+[package]
+name = "grok-desktop"
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+description = "Grok Build desktop app — a chat GUI over the grok agent (ACP)"
+repository = "https://github.com/suolaraketti/grok-build"
+
+[workspace]
+
+[lib]
+name = "grok_desktop_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+tauri = { version = "2", features = [] }
+tauri-plugin-dialog = "2"
+tauri-plugin-opener = "2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+[profile.release]
+codegen-units = 1
+lto = true
+opt-level = "s"
+strip = true
