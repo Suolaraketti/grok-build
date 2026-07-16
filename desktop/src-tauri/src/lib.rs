@@ -232,6 +232,92 @@ fn home_dir(app: AppHandle) -> Option<String> {
     app.path().home_dir().ok().map(|p| p.display().to_string())
 }
 
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct StoredSession {
+    session_id: String,
+    cwd: String,
+    title: String,
+    updated_at: String,
+    model_id: Option<String>,
+    num_messages: u64,
+}
+
+/// List past sessions by scanning `~/.grok/sessions/<encoded-cwd>/<id>/summary.json`
+/// (the same storage the CLI's /resume picker reads). Honors GROK_HOME.
+#[tauri::command]
+fn list_sessions(app: AppHandle, limit: Option<usize>) -> Vec<StoredSession> {
+    let root = std::env::var_os("GROK_HOME")
+        .map(PathBuf::from)
+        .or_else(|| app.path().home_dir().ok().map(|h| h.join(".grok")))
+        .map(|h| h.join("sessions"));
+    let Some(root) = root else { return Vec::new() };
+
+    let mut out: Vec<StoredSession> = Vec::new();
+    let Ok(groups) = std::fs::read_dir(&root) else { return Vec::new() };
+    for group in groups.flatten() {
+        if !group.path().is_dir() {
+            continue;
+        }
+        let Ok(sessions) = std::fs::read_dir(group.path()) else { continue };
+        for dir in sessions.flatten() {
+            let summary_path = dir.path().join("summary.json");
+            let Ok(raw) = std::fs::read_to_string(&summary_path) else { continue };
+            let Ok(v) = serde_json::from_str::<serde_json::Value>(&raw) else { continue };
+
+            // Skip hidden sessions and machine-created kinds (subagents etc.);
+            // only plain user conversations belong in the sidebar.
+            if v.get("hidden").and_then(|h| h.as_bool()) == Some(true) {
+                continue;
+            }
+            if let Some(kind) = v.get("session_kind").and_then(|k| k.as_str()) {
+                if kind.contains("subagent") {
+                    continue;
+                }
+            }
+
+            let info = v.get("info");
+            let (Some(id), Some(cwd)) = (
+                info.and_then(|i| i.get("id")).and_then(|x| x.as_str()),
+                info.and_then(|i| i.get("cwd")).and_then(|x| x.as_str()),
+            ) else {
+                continue;
+            };
+            let num_messages = v
+                .get("num_chat_messages")
+                .or_else(|| v.get("num_messages"))
+                .and_then(|n| n.as_u64())
+                .unwrap_or(0);
+            if num_messages == 0 {
+                continue; // never-used empty sessions are noise
+            }
+            out.push(StoredSession {
+                session_id: id.to_string(),
+                cwd: cwd.to_string(),
+                title: v
+                    .get("session_summary")
+                    .and_then(|s| s.as_str())
+                    .unwrap_or("")
+                    .to_string(),
+                updated_at: v
+                    .get("updated_at")
+                    .and_then(|s| s.as_str())
+                    .unwrap_or("")
+                    .to_string(),
+                model_id: v
+                    .get("current_model_id")
+                    .and_then(|s| s.as_str())
+                    .map(String::from),
+                num_messages,
+            });
+        }
+    }
+    // RFC 3339 sorts lexicographically; newest first.
+    out.sort_by(|a, b| b.updated_at.cmp(&a.updated_at));
+    out.truncate(limit.unwrap_or(200));
+    out
+}
+
 #[tauri::command]
 fn open_external(app: AppHandle, url: String) -> Result<(), String> {
     if !(url.starts_with("https://") || url.starts_with("http://")) {
@@ -254,6 +340,7 @@ pub fn run() {
             agent_binary_info,
             pick_folder,
             home_dir,
+            list_sessions,
             open_external,
         ])
         .on_window_event(|window, event| {

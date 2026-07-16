@@ -98,6 +98,13 @@ export class AgentClient {
     return await this.request("session/new", { cwd, mcpServers: [] });
   }
 
+  // Restore a stored session for continuation. The agent replays the whole
+  // transcript as session/update notifications BEFORE this resolves, so the
+  // caller must be ready to route updates for this sessionId when calling.
+  async loadSession(sessionId, cwd) {
+    return await this.request("session/load", { sessionId, cwd, mcpServers: [] });
+  }
+
   async prompt(sessionId, text) {
     return await this.request("session/prompt", {
       sessionId,
@@ -252,4 +259,5 @@ export class AgentClient {
 export async function agentBinaryInfo() { return await invoke("agent_binary_info"); }
 export async function pickFolder() { return await invoke("pick_folder"); }
 export async function homeDir() { return await invoke("home_dir"); }
+export async function listStoredSessions(limit) { return await invoke("list_sessions", { limit }); }
 export async function openExternal(url) { return await invoke("open_external", { url }); }
