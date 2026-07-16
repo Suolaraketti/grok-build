@@ -105,8 +105,56 @@ and on `desktop-v*` tags:
 | Windows | `.msi`, NSIS `.exe` |
 | Linux | `.deb`, `.rpm`, `.AppImage` |
 
-Each bundle ships the agent binary built from this repository. To build
-locally instead:
+Each bundle ships the agent binary built from this repository.
+
+### Installing a downloaded build
+
+Grab the installer for your platform from the
+[Releases page](https://github.com/Suolaraketti/grok-build/releases):
+
+| Platform | File | First launch |
+|----------|------|--------------|
+| macOS | `.dmg` | If the build is unsigned: right-click the app → **Open** → **Open** (only needed once). Signed/notarized builds open normally. |
+| Windows | `.msi` or setup `.exe` | If SmartScreen appears: **More info** → **Run anyway** (unsigned builds only). |
+| Linux (Debian/Ubuntu) | `.deb` | `sudo apt install ./Grok.Build_*.deb` |
+| Linux (Fedora) | `.rpm` | `sudo dnf install ./Grok.Build-*.rpm` |
+| Linux (any) | `.AppImage` | `chmod +x`, then run it. |
+
+The app signs you in with your Grok account on first launch (or an xAI API
+key). No terminal, no other installs — the agent is bundled inside.
+
+### Code signing (maintainers)
+
+The workflow signs and notarizes macOS builds automatically **when Apple
+credentials are configured as repository secrets** — with them set, Mac users
+get no Gatekeeper prompt at all. Without them, builds are produced unsigned.
+
+With an Apple Developer account:
+
+1. In Xcode (Settings → Accounts → Manage Certificates) or at
+   [developer.apple.com/account/resources/certificates](https://developer.apple.com/account/resources/certificates),
+   create a **Developer ID Application** certificate.
+2. Export it from Keychain Access as a `.p12` with a password, then base64 it:
+   `base64 -i certificate.p12 | pbcopy`
+3. Create an **app-specific password** for your Apple ID at
+   [appleid.apple.com](https://appleid.apple.com) (Sign-In & Security →
+   App-Specific Passwords) — used for notarization.
+4. Add these repository secrets (Settings → Secrets and variables → Actions):
+
+| Secret | Value |
+|--------|-------|
+| `APPLE_CERTIFICATE` | base64 of the `.p12` |
+| `APPLE_CERTIFICATE_PASSWORD` | the `.p12` export password |
+| `APPLE_SIGNING_IDENTITY` | e.g. `Developer ID Application: Your Name (TEAMID)` |
+| `APPLE_ID` | your Apple ID email |
+| `APPLE_PASSWORD` | the app-specific password |
+| `APPLE_TEAM_ID` | your 10-character team ID |
+
+The next tagged build is then signed and notarized. Windows signing is
+separate (a Microsoft-trusted certificate, e.g. Azure Trusted Signing) and
+not configured yet — Windows builds show SmartScreen until it is.
+
+To build locally instead:
 
 ```sh
 cargo build --release -p xai-grok-pager-bin
