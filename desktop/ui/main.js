@@ -312,7 +312,14 @@ async function refreshAccount() {
     [info.firstName, info.lastName].filter(Boolean).join(" ") ||
     info.email ||
     "Signed in";
-  const sub = info.teamName || info.email || "";
+  let sub = info.teamName || info.email || "";
+  // Make API-key billing visible: requests on xai.api_key bill console.x.ai
+  // credits with their own rate limits, NOT the user's Grok plan. Confusing
+  // rate limits are usually this.
+  state.authMethodId = info.methodId || null;
+  if (info.methodId === "xai.api_key") {
+    sub = sub ? `${sub} · API key` : "API key billing";
+  }
   state.account = { email: info.email || null, name, sub };
   $("account-name").textContent = name;
   $("account-sub").textContent = sub && sub !== name ? sub : "";
@@ -549,13 +556,55 @@ function beginTurn(chat, withSpinner = true) {
   chat.turn = {
     container,
     spinner,
+    hasSpinner: withSpinner,
     mdDiv: null,
     textBuf: "",
     thoughtEl: null,
     thoughtBody: "",
     toolCards: new Map(),
     planEl: null,
+    lastActivity: Date.now(),
+    statusOverride: null,
   };
+  if (withSpinner) armTurnWatchdog(chat);
+}
+
+// Working-status line under the streamed content. `override` semantics:
+// a string sets a notice (retry/compaction) that wins over the default,
+// null clears it, undefined re-renders the current state.
+function setTurnStatus(chat, override) {
+  const turn = chat.turn;
+  if (!turn || !turn.hasSpinner) return;
+  if (override !== undefined) turn.statusOverride = override;
+  let text = turn.statusOverride;
+  if (!text) {
+    const quiet = Date.now() - turn.lastActivity;
+    text =
+      quiet > 30_000
+        ? "Still working — long tasks (and rate-limit retries) can take a while. Stop cancels the turn."
+        : "Working…";
+  }
+  turn.spinner.textContent = text;
+}
+
+function armTurnWatchdog(chat) {
+  const turn = chat.turn;
+  const timer = setInterval(() => {
+    if (chat.turn !== turn) {
+      clearInterval(timer);
+      return;
+    }
+    setTurnStatus(chat, undefined);
+  }, 5000);
+}
+
+function bumpActivity(chat) {
+  if (chat.turn) {
+    chat.turn.lastActivity = Date.now();
+    // Fresh content clears a stale retry/slow notice.
+    if (chat.turn.statusOverride) setTurnStatus(chat, null);
+    else setTurnStatus(chat, undefined);
+  }
 }
 
 function endTurn(chat) {
@@ -637,6 +686,7 @@ function handleUpdate(params) {
   // Content arriving outside a prompt we initiated gets no "Working…" spinner.
   if (!chat.turn) beginTurn(chat, chat.busy);
   const turn = chat.turn;
+  bumpActivity(chat);
 
   switch (update.sessionUpdate) {
     case "agent_message_chunk": {
@@ -747,9 +797,75 @@ function handleUpdate(params) {
 
 client.onSessionUpdate = handleUpdate;
 
+// ---- retry / compaction side channel (x.ai/session_notification) ----
+//
+// When the backend rate-limits, the agent retries with backoff instead of
+// failing the turn. Without surfacing retry_state the UI looks hung.
+client.onSessionNotification = (params) => {
+  const chat = chatBySession(params?.sessionId);
+  if (!chat) return;
+  const update = params.update || {};
+
+  switch (update.sessionUpdate) {
+    case "retry_state": {
+      if (update.type === "retrying") {
+        const rate = /rate.?limit|429/i.test(update.reason || "");
+        const label = rate ? "Rate limited by the server" : `Retrying: ${update.reason || "transient error"}`;
+        setTurnStatus(chat, `${label} — retrying (attempt ${update.attempt} of ${update.maxRetries})…`);
+      } else if (update.type === "exhausted") {
+        const msg = update.is_rate_limited || update.isRateLimited
+          ? "Rate limit persisted through all retries. Your plan's limit likely needs a few minutes to reset — try again shortly."
+          : `Gave up after ${update.attempts} attempts: ${update.reason || "unknown error"}`;
+        appendErrorNote(chat, msg);
+        setTurnStatus(chat, null);
+      } else if (update.type === "failed") {
+        const authy = update.error_type === "auth" || update.errorType === "auth";
+        appendErrorNote(
+          chat,
+          authy
+            ? `${update.message || "Authentication failed."}\n\nSign out and back in from the account menu.`
+            : update.message || "The request failed."
+        );
+        setTurnStatus(chat, null);
+      }
+      break;
+    }
+    case "auto_compact_started":
+      setTurnStatus(chat, `Conversation is long (${update.percentage ?? "?"}% of context) — compacting…`);
+      break;
+    case "auto_compact_completed":
+      setTurnStatus(chat, null);
+      break;
+    case "auto_compact_failed":
+      setTurnStatus(chat, null);
+      break;
+    default:
+      break;
+  }
+};
+
+function appendErrorNote(chat, msg) {
+  const note = document.createElement("div");
+  note.className = "error-note";
+  note.textContent = msg;
+  (chat.turn?.container || chat.el).appendChild(note);
+  scrollToBottom();
+}
+
 // ============================ PERMISSIONS ============================
 
-client.onPermissionRequest = (params) =>
+// Permission requests can arrive concurrently (parallel tool calls). The
+// modal shows one at a time; without this queue a second request would
+// overwrite the first's dialog and orphan its promise — the agent then waits
+// on the unanswered request forever and the whole session looks hung.
+let permQueue = Promise.resolve();
+client.onPermissionRequest = (params) => {
+  const turn = permQueue.then(() => showPermissionModal(params));
+  permQueue = turn.then(() => {}, () => {});
+  return turn;
+};
+
+const showPermissionModal = (params) =>
   new Promise((resolve) => {
     const overlay = $("perm-overlay");
     const body = $("perm-body");
@@ -932,6 +1048,12 @@ function renderBilling(box, tierEl, billing) {
   }
 
   const rows = [];
+  if (state.authMethodId) {
+    rows.push([
+      "Billing via",
+      state.authMethodId === "xai.api_key" ? "API key (console.x.ai)" : "Grok account",
+    ]);
+  }
   const period = cfg.currentPeriod || {};
   const end = period.end || cfg.billingPeriodEnd;
   if (end) {
