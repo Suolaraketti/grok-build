@@ -114,6 +114,9 @@
           <span id="folder-label">Open a folder</span>
         </button>
         <div class="topbar-spacer"></div>
+        <button id="usage-btn" class="chip" title="Usage &amp; credits">
+          <span id="usage-label">Usage</span>
+        </button>
         <button id="model-btn" class="chip" title="Model">
           <span id="model-label">Default model</span>
           <svg viewBox="0 0 16 16" width="12" height="12" aria-hidden="true"><path fill="currentColor" d="M4.5 6.5 8 10l3.5-3.5"/></svg>
@@ -136,6 +139,7 @@
         </div>
 
         <div id="composer">
+          <div id="slash-menu" class="slash-menu hidden"></div>
           <div id="composer-inner">
             <textarea id="prompt-input" rows="1"
               placeholder="Ask Grok to build, fix, or explain something…"></textarea>
@@ -183,6 +187,32 @@
       <p class="muted small">Changes to the model or auto-approve take effect on the next new chat.</p>
       <div class="perm-options">
         <button id="settings-close" class="btn btn-primary">Done</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- ============================ USAGE MODAL ============================ -->
+  <div id="usage-overlay" class="overlay hidden" role="dialog" aria-modal="true">
+    <div class="modal">
+      <div class="modal-head">
+        <h2>Usage &amp; credits</h2>
+        <span id="usage-tier" class="tier-badge hidden"></span>
+      </div>
+
+      <div class="usage-section">
+        <h3>This chat</h3>
+        <div id="usage-session" class="usage-grid"></div>
+      </div>
+
+      <div class="usage-section">
+        <h3>Your plan</h3>
+        <div id="usage-account">
+          <p class="muted small">Loading…</p>
+        </div>
+      </div>
+
+      <div class="perm-options">
+        <button id="usage-close" class="btn btn-primary">Done</button>
       </div>
     </div>
   </div>
