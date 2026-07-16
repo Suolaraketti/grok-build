@@ -23,7 +23,8 @@ jobs:
         include:
           - os: macos-14 # Apple Silicon
             bundles: target/release/bundle/dmg/*.dmg
-          - os: macos-13 # Intel
+          # macos-13 was retired Dec 2025; macos-15-intel is the last hosted Intel image.
+          - os: macos-15-intel
             bundles: target/release/bundle/dmg/*.dmg
           - os: ubuntu-22.04
             bundles: |
