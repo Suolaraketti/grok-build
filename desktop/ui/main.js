@@ -973,6 +973,10 @@ function updateUsageChip() {
 
 $("usage-btn").addEventListener("click", openUsage);
 $("usage-close").addEventListener("click", () => $("usage-overlay").classList.add("hidden"));
+$("usage-refresh").addEventListener("click", () => {
+  state.billing = null; // bust the cache
+  openUsage();
+});
 
 function usageStat(v, k) {
   const div = document.createElement("div");
@@ -1018,6 +1022,10 @@ async function openUsage() {
   renderBilling(box, tierEl, state.billing);
 }
 
+// Mirrors the official pager's credit_balance_from_config derivation:
+// percent from creditUsagePercent (else used/limit), Weekly/Monthly label
+// from the period type, floored percent (backend truncates the same way),
+// signed prepaid cents (negative = balance, accounting convention).
 function renderBilling(box, tierEl, billing) {
   box.textContent = "";
   tierEl.classList.add("hidden");
@@ -1038,28 +1046,38 @@ function renderBilling(box, tierEl, billing) {
     tierEl.classList.remove("hidden");
   }
 
-  const cents = (c) => (c && typeof c.val === "number" ? c.val / 100 : null);
+  const centsVal = (c) => (c && typeof c.val === "number" ? c.val : null);
 
-  // Included-credit progress.
+  const limitC = centsVal(cfg.monthlyLimit) ?? 0;
+  const usedC = centsVal(cfg.used) ?? 0;
   let pct = cfg.creditUsagePercent;
-  const used = cents(cfg.used);
-  const limit = cents(cfg.monthlyLimit);
-  if (pct == null && used != null && limit != null && limit > 0) pct = (used / limit) * 100;
+  if (pct == null) pct = limitC > 0 ? Math.min((usedC / limitC) * 100, 100) : null;
+  if (pct != null) pct = Math.min(Math.max(pct, 0), 100);
+
+  const periodType = cfg.currentPeriod?.type || "";
+  const planLabel = periodType.includes("WEEKLY")
+    ? "Weekly limit"
+    : periodType.includes("MONTHLY")
+    ? "Monthly limit"
+    : "Plan usage";
 
   if (pct != null) {
+    const pctFloor = Math.floor(pct);
     const label = document.createElement("div");
     label.className = "usage-row";
-    label.innerHTML = "<span>Included credits used</span>";
+    const kk = document.createElement("span");
+    kk.textContent = planLabel;
     const r = document.createElement("span");
     r.className = "r";
-    r.textContent = `${Math.round(pct)}%`;
+    r.textContent = `${pctFloor}% used · ${100 - pctFloor}% left`;
+    label.appendChild(kk);
     label.appendChild(r);
     box.appendChild(label);
 
     const bar = document.createElement("div");
     bar.className = "credit-bar";
     const fill = document.createElement("div");
-    fill.style.width = `${Math.min(100, Math.max(0, pct))}%`;
+    fill.style.width = `${pct}%`;
     if (pct >= 90) fill.className = "hot";
     bar.appendChild(fill);
     box.appendChild(bar);
@@ -1072,22 +1090,38 @@ function renderBilling(box, tierEl, billing) {
       state.authMethodId === "xai.api_key" ? "API key (console.x.ai)" : "Grok account",
     ]);
   }
-  const period = cfg.currentPeriod || {};
-  const end = period.end || cfg.billingPeriodEnd;
-  if (end) {
-    const d = new Date(end);
-    if (!isNaN(d)) rows.push(["Resets", d.toLocaleDateString(undefined, { month: "short", day: "numeric" })]);
-  }
-  const odUsed = cents(cfg.onDemandUsed);
-  const odCap = cents(cfg.onDemandCap);
-  if (resp.onDemandEnabled !== false && (odUsed != null || odCap != null)) {
+  // Absolute plan dollars only exist on the legacy shape; show when present.
+  if (limitC > 0) {
     rows.push([
-      "On-demand",
-      `${odUsed != null ? fmtUsd(odUsed) : "$0.00"}${odCap != null && odCap > 0 ? ` of ${fmtUsd(odCap)}` : ""}`,
+      "Included credits",
+      `${fmtUsd(usedC / 100)} used of ${fmtUsd(limitC / 100)} · ${fmtUsd(Math.max(limitC - usedC, 0) / 100)} left`,
     ]);
   }
-  const prepaid = cents(cfg.prepaidBalance);
-  if (prepaid != null && prepaid > 0) rows.push(["Credit balance", fmtUsd(prepaid)]);
+  const end = cfg.currentPeriod?.end || cfg.billingPeriodEnd;
+  if (end) {
+    const d = new Date(end);
+    if (!isNaN(d)) {
+      rows.push([
+        "Resets",
+        d.toLocaleString(undefined, { month: "short", day: "numeric", hour: "numeric", minute: "2-digit" }),
+      ]);
+    }
+  }
+  const odCapC = centsVal(cfg.onDemandCap);
+  const odUsedC = centsVal(cfg.onDemandUsed) ?? (limitC > 0 ? Math.max(usedC - limitC, 0) : null);
+  if (resp.onDemandEnabled !== false && odCapC != null && odCapC > 0) {
+    rows.push([
+      "On-demand",
+      `${fmtUsd((odUsedC ?? 0) / 100)} used of ${fmtUsd(odCapC / 100)} · ${fmtUsd(Math.max(odCapC - (odUsedC ?? 0), 0) / 100)} left`,
+    ]);
+  } else if (odUsedC != null && odUsedC > 0) {
+    rows.push(["On-demand", `${fmtUsd(odUsedC / 100)} used`]);
+  }
+  // Prepaid balances arrive as negative cents (accounting convention).
+  const prepaidC = centsVal(cfg.prepaidBalance);
+  if (prepaidC != null && prepaidC !== 0) {
+    rows.push(["Credit balance", `${fmtUsd(Math.abs(prepaidC) / 100)} available`]);
+  }
 
   for (const [k, v] of rows) {
     const row = document.createElement("div");
@@ -1102,10 +1136,33 @@ function renderBilling(box, tierEl, billing) {
     box.appendChild(row);
   }
 
+  // Past billing periods.
+  const history = (cfg.history || []).slice(-3).reverse();
+  for (const h of history) {
+    const cyc = h.billingCycle;
+    const total = centsVal(h.totalUsed) ?? centsVal(h.includedUsed);
+    if (!cyc || total == null) continue;
+    const name = new Date(cyc.year, (cyc.month || 1) - 1).toLocaleDateString(undefined, {
+      month: "short",
+      year: "numeric",
+    });
+    const row = document.createElement("div");
+    row.className = "usage-row";
+    const kk = document.createElement("span");
+    kk.textContent = name;
+    const vv = document.createElement("span");
+    vv.className = "r";
+    vv.textContent = fmtUsd(total / 100);
+    row.appendChild(kk);
+    row.appendChild(vv);
+    box.appendChild(row);
+  }
+
   if (!box.childElementCount) {
     const p = document.createElement("p");
     p.className = "muted small";
-    p.textContent = "No plan usage reported for this account.";
+    p.textContent =
+      "No plan usage reported for this account. If you're on an API key, spend lives at console.x.ai.";
     box.appendChild(p);
   }
 }
