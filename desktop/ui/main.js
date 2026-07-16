@@ -809,13 +809,21 @@ client.onSessionNotification = (params) => {
   switch (update.sessionUpdate) {
     case "retry_state": {
       if (update.type === "retrying") {
-        const rate = /rate.?limit|429/i.test(update.reason || "");
-        const label = rate ? "Rate limited by the server" : `Retrying: ${update.reason || "transient error"}`;
-        setTurnStatus(chat, `${label} — retrying (attempt ${update.attempt} of ${update.maxRetries})…`);
+        const reason = shortReason(update.reason);
+        // RetryState fields are snake_case on the wire (max_retries,
+        // is_rate_limited, error_type); camelCase kept as fallback.
+        const max = update.max_retries ?? update.maxRetries;
+        const attempts = `attempt ${update.attempt}${max ? ` of ${max}` : ""}`;
+        const label = /rate.?limit|429/i.test(reason)
+          ? "Rate limited by the server"
+          : /50\d|unavailable|overloaded|connect error|connection|timeout/i.test(reason)
+          ? "Grok's servers are having a moment"
+          : `Hit a snag (${reason})`;
+        setTurnStatus(chat, `${label} — retrying (${attempts})…`);
       } else if (update.type === "exhausted") {
         const msg = update.is_rate_limited || update.isRateLimited
           ? "Rate limit persisted through all retries. Your plan's limit likely needs a few minutes to reset — try again shortly."
-          : `Gave up after ${update.attempts} attempts: ${update.reason || "unknown error"}`;
+          : `Gave up after ${update.attempts} attempts: ${shortReason(update.reason)}`;
         appendErrorNote(chat, msg);
         setTurnStatus(chat, null);
       } else if (update.type === "failed") {
@@ -843,6 +851,16 @@ client.onSessionNotification = (params) => {
       break;
   }
 };
+
+// Retry reasons can be a full request/response dump (URL, headers, cookies).
+// Keep the first meaningful line, capped, for the one-line status banner.
+function shortReason(reason) {
+  if (!reason) return "transient error";
+  let r = String(reason).split(/Request URL:|Request headers:|Response headers:/)[0];
+  r = r.split("\n")[0].trim().replace(/[.,;:\s]+$/, "");
+  if (r.length > 140) r = r.slice(0, 140) + "…";
+  return r || "transient error";
+}
 
 function appendErrorNote(chat, msg) {
   const note = document.createElement("div");
