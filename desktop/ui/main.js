@@ -13,15 +13,25 @@ import { renderMarkdown } from "./markdown.js";
 const $ = (id) => document.getElementById(id);
 const client = new AgentClient();
 
+const prefs = {
+  get folder() { return localStorage.getItem("grok.folder") || ""; },
+  set folder(v) { v ? localStorage.setItem("grok.folder", v) : localStorage.removeItem("grok.folder"); },
+  get model() { return localStorage.getItem("grok.model") || ""; },
+  set model(v) { v ? localStorage.setItem("grok.model", v) : localStorage.removeItem("grok.model"); },
+  get alwaysApprove() { return localStorage.getItem("grok.alwaysApprove") === "1"; },
+  set alwaysApprove(v) { localStorage.setItem("grok.alwaysApprove", v ? "1" : "0"); },
+};
+
 const state = {
-  folder: "",
-  model: "",
-  alwaysApprove: false,
-  account: null, // { email, name, avatar, sub }
+  folder: "", // set from prefs at enterApp; NEVER defaults to the home dir
+  homeDir: "",
+  account: null,
   chats: [],
   activeChat: null,
   stderrTail: [],
-  authSeq: 0, // guards stale auth attempts
+  authSeq: 0,
+  commands: [], // slash commands advertised by the agent
+  billing: null, // {at, data|error}
 };
 
 const SUGGESTIONS = [
@@ -37,12 +47,12 @@ function show(screen) {
   }
 }
 
-function toast(msg) {
+function toast(msg, ms = 3200) {
   const t = $("toast");
   t.textContent = msg;
   t.classList.remove("hidden");
   clearTimeout(toast._t);
-  toast._t = setTimeout(() => t.classList.add("hidden"), 2200);
+  toast._t = setTimeout(() => t.classList.add("hidden"), ms);
 }
 
 // ============================ BOOT / STARTUP ============================
@@ -63,12 +73,14 @@ async function boot() {
   }
 
   try {
-    await client.start({ model: state.model || null, alwaysApprove: state.alwaysApprove });
+    await client.start({ model: prefs.model || null, alwaysApprove: prefs.alwaysApprove });
   } catch (err) {
     show("signin");
     signinError(`Couldn't start the agent: ${err.message || err}`);
     return;
   }
+
+  state.commands = client.availableCommands();
 
   // Already authenticated? cached_token / xai.api_key are only advertised when
   // valid credentials exist, so activating them never opens a browser.
@@ -101,7 +113,6 @@ function presentSignin() {
       : "Sign in with Grok";
     $("signin-oauth").disabled = false;
   } else {
-    // No interactive method (e.g. admin-pinned API-key auth): hide OAuth.
     $("signin-oauth").classList.add("hidden");
     $("apikey-panel").classList.remove("hidden");
     $("signin-apikey-toggle").classList.add("hidden");
@@ -212,7 +223,6 @@ function resetAuthingUI(providerName) {
   $("authing-open").dataset.url = "";
 }
 
-// Shape the authenticating screen to the login mode reported by get_url.
 function applyAuthUrl(info) {
   const url = info.auth_url || info.authUrl || null;
   const mode = info.mode || (info.external_provider ? "command" : "loopback");
@@ -224,7 +234,6 @@ function applyAuthUrl(info) {
   }
 
   if (mode === "device") {
-    // The URL often carries the user code; show it prominently.
     $("authing-title").textContent = "Enter the code to sign in";
     $("authing-desc").textContent =
       "We opened your browser. Confirm this code matches what you see there.";
@@ -238,7 +247,6 @@ function applyAuthUrl(info) {
     $("authing-desc").textContent =
       "Your sign-in provider opened in the browser. Come back once you're done.";
   } else {
-    // loopback — automatic, with a manual paste fallback.
     $("authing-paste").classList.remove("hidden");
   }
 }
@@ -264,7 +272,7 @@ $("authing-code-submit").addEventListener("click", () => {
 });
 
 $("authing-cancel").addEventListener("click", () => {
-  state.authSeq++; // invalidate the in-flight attempt
+  state.authSeq++;
   presentSignin();
 });
 
@@ -279,15 +287,17 @@ function friendlyAuthError(err) {
 async function enterApp() {
   show("app");
   await refreshAccount();
-  if (!state.folder) {
-    const home = await homeDir();
-    state.folder = home || ".";
-  }
+  state.homeDir = (await homeDir()) || "";
+  // Restore the last project folder the user explicitly picked. No folder —
+  // no default: chatting is gated until they choose one, so the agent never
+  // scans a home directory by accident.
+  state.folder = prefs.folder;
   updateFolderLabel();
   updateModelLabel();
   populateSuggestions();
-  if (!state.chats.length) await newChat();
+  if (state.folder && !state.chats.length) await newChat();
   updateEmptyState();
+  updateComposer();
   $("prompt-input").focus();
 }
 
@@ -301,18 +311,11 @@ async function refreshAccount() {
   const name =
     [info.firstName, info.lastName].filter(Boolean).join(" ") ||
     info.email ||
-    (client.binaryPath ? "Signed in" : "Signed in");
+    "Signed in";
   const sub = info.teamName || info.email || "";
-  state.account = {
-    email: info.email || null,
-    name,
-    sub,
-    avatar: info.profileImageUrl || null,
-  };
+  state.account = { email: info.email || null, name, sub };
   $("account-name").textContent = name;
   $("account-sub").textContent = sub && sub !== name ? sub : "";
-  // Initials avatar — remote profile images are either grok-asset:// (Electron
-  // only) or blocked by the app's img-src CSP, so we don't fetch them.
   $("account-avatar").textContent = (name || "?").trim().charAt(0).toUpperCase() || "?";
 }
 
@@ -324,6 +327,7 @@ function populateSuggestions() {
     b.className = "suggestion";
     b.textContent = s;
     b.addEventListener("click", () => {
+      if (!state.folder) { chooseFolder(); return; }
       $("prompt-input").value = s;
       autosize($("prompt-input"));
       sendPrompt();
@@ -341,6 +345,7 @@ $("account-btn").addEventListener("click", (e) => {
 document.addEventListener("click", () => {
   $("account-menu").classList.add("hidden");
   $("model-menu").classList.add("hidden");
+  hideSlashMenu();
 });
 $("account-menu").addEventListener("click", (e) => e.stopPropagation());
 
@@ -356,9 +361,9 @@ $("menu-signout").addEventListener("click", async () => {
   } catch {
     /* ignore */
   }
-  // Reset app state and go back to sign-in.
   state.chats = [];
   state.activeChat = null;
+  state.billing = null;
   $("transcripts").textContent = "";
   $("chat-list").textContent = "";
   presentSignin();
@@ -367,14 +372,13 @@ $("menu-signout").addEventListener("click", async () => {
 // ============================ SETTINGS ============================
 
 function openSettings() {
-  $("set-yolo").checked = state.alwaysApprove;
-  $("set-model").value = state.model;
+  $("set-yolo").checked = prefs.alwaysApprove;
+  $("set-model").value = prefs.model;
   $("settings-overlay").classList.remove("hidden");
 }
 $("settings-close").addEventListener("click", () => {
-  state.alwaysApprove = $("set-yolo").checked;
-  state.model = $("set-model").value.trim();
-  updateModelLabel();
+  prefs.alwaysApprove = $("set-yolo").checked;
+  prefs.model = $("set-model").value.trim();
   $("settings-overlay").classList.add("hidden");
 });
 
@@ -382,31 +386,69 @@ $("settings-close").addEventListener("click", () => {
 
 async function chooseFolder() {
   const picked = await pickFolder();
-  if (picked) {
-    state.folder = picked;
-    updateFolderLabel();
+  if (!picked) return;
+
+  if (state.homeDir && picked.replace(/[\\/]+$/, "") === state.homeDir.replace(/[\\/]+$/, "")) {
+    toast("That's your whole user folder — pick the specific project instead.", 4200);
+    return;
   }
+
+  state.folder = picked;
+  prefs.folder = picked;
+  updateFolderLabel();
+
+  const chat = state.activeChat;
+  if (chat && !chat.busy && chat.el.childElementCount === 0) {
+    // Empty chat: rebind it to the new folder instead of leaving a stale cwd.
+    try {
+      const session = await client.newSession(picked);
+      chat.sessionId = session.sessionId;
+      applySessionInfo(chat, session);
+    } catch (err) {
+      toast(`Couldn't open folder: ${err.message || err}`);
+    }
+  } else {
+    await newChat();
+  }
+  updateEmptyState();
+  updateComposer();
+  $("prompt-input").focus();
 }
 $("folder-btn").addEventListener("click", chooseFolder);
 $("empty-open-folder").addEventListener("click", chooseFolder);
 
 function updateFolderLabel() {
   const f = state.folder;
-  const short = f ? f.split("/").filter(Boolean).slice(-2).join("/") || f : "Open a folder";
+  const short = f ? f.split(/[\\/]/).filter(Boolean).slice(-2).join("/") || f : "Open a folder";
   $("folder-label").textContent = short;
-  $("folder-btn").title = f || "Open a folder";
+  $("folder-btn").title = f || "Open a project folder";
 }
 
-function updateModelLabel() {
-  $("model-label").textContent = state.model || "Default model";
+// Apply per-session info from a session/new response: model state and the
+// non-git-repo warning (the guard against "it scanned my whole user dir").
+function applySessionInfo(chat, session) {
+  chat.models = session.models || { currentModelId: null, availableModels: [] };
+  updateModelLabel();
+  const meta = session._meta || {};
+  if (meta.showNonGitWarning || meta.isGitRepo === false) {
+    toast("Heads up: this folder isn't a git repository. Grok works best inside a project folder.", 5000);
+  }
 }
 
 // ============================ CHATS ============================
 
+function emptyUsage() {
+  return { input: 0, output: 0, costTicks: 0, costTrusted: true, turns: 0, calls: 0 };
+}
+
 async function newChat() {
+  if (!state.folder) {
+    updateEmptyState();
+    return;
+  }
   let session;
   try {
-    session = await client.newSession(state.folder || ".");
+    session = await client.newSession(state.folder);
   } catch (err) {
     toast(`Couldn't start a chat: ${err.message || err}`);
     return;
@@ -427,12 +469,15 @@ async function newChat() {
     titleEl: item,
     turn: null,
     busy: false,
+    models: null,
+    usage: emptyUsage(),
+    folder: state.folder,
   };
+  applySessionInfo(chat, session);
   item.addEventListener("click", () => switchChat(chat));
   $("chat-list").prepend(item);
   state.chats.push(chat);
   switchChat(chat);
-  updateEmptyState();
 }
 
 function switchChat(chat) {
@@ -443,6 +488,8 @@ function switchChat(chat) {
   }
   updateComposer();
   updateEmptyState();
+  updateModelLabel();
+  updateUsageChip();
   $("prompt-input").focus();
 }
 
@@ -450,13 +497,19 @@ function chatBySession(sessionId) {
   return state.chats.find((c) => c.sessionId === sessionId);
 }
 
-$("new-chat").addEventListener("click", newChat);
+$("new-chat").addEventListener("click", () => {
+  if (!state.folder) { chooseFolder(); return; }
+  newChat();
+});
 
 function updateEmptyState() {
   const chat = state.activeChat;
-  const empty = chat && chat.el.childElementCount === 0;
-  $("empty-state").classList.toggle("hidden", !empty);
-  $("empty-folder-cta").classList.add("hidden"); // folder always has a default
+  const noFolder = !state.folder;
+  const emptyChat = chat && chat.el.childElementCount === 0;
+  const showEmpty = noFolder || !chat || emptyChat;
+  $("empty-state").classList.toggle("hidden", !showEmpty);
+  $("empty-folder-cta").classList.toggle("hidden", !noFolder);
+  $("empty-suggestions").classList.toggle("hidden", noFolder);
 }
 
 // ============================ TRANSCRIPT RENDERING ============================
@@ -522,6 +575,44 @@ function contentText(content) {
   return "";
 }
 
+// Render ToolCallContent items (text output, file diffs) into a card body.
+function renderToolContent(body, items) {
+  body.textContent = "";
+  const clip = (s, n = 4000) => (s && s.length > n ? s.slice(0, n) + "\n…" : s || "");
+  for (const item of items || []) {
+    if (!item || typeof item !== "object") continue;
+    if (item.type === "diff" || item.diff) {
+      const d = item.diff || item;
+      const path = document.createElement("div");
+      path.className = "diff-path";
+      path.textContent = d.path || "";
+      body.appendChild(path);
+      if (d.oldText) {
+        const pre = document.createElement("pre");
+        pre.className = "diff-old";
+        const code = document.createElement("code");
+        code.textContent = clip(d.oldText);
+        pre.appendChild(code);
+        body.appendChild(pre);
+      }
+      const pre = document.createElement("pre");
+      pre.className = "diff-new";
+      const code = document.createElement("code");
+      code.textContent = clip(d.newText);
+      pre.appendChild(code);
+      body.appendChild(pre);
+    } else {
+      const text = contentText(item.content ?? item);
+      if (!text) continue;
+      const pre = document.createElement("pre");
+      const code = document.createElement("code");
+      code.textContent = clip(text);
+      pre.appendChild(code);
+      body.appendChild(pre);
+    }
+  }
+}
+
 const TURN_CONTENT = new Set([
   "agent_message_chunk",
   "agent_thought_chunk",
@@ -531,12 +622,16 @@ const TURN_CONTENT = new Set([
 ]);
 
 function handleUpdate(params) {
-  const chat = chatBySession(params.sessionId);
-  if (!chat) return;
   const update = params.update ?? {};
 
-  // The agent also emits non-turn notifications (available commands, mode,
-  // etc.). Only actual turn content should open a turn and show the spinner.
+  // Non-turn notifications we care about.
+  if (update.sessionUpdate === "available_commands_update") {
+    state.commands = update.availableCommands || [];
+    return;
+  }
+
+  const chat = chatBySession(params.sessionId);
+  if (!chat) return;
   if (!TURN_CONTENT.has(update.sessionUpdate)) return;
 
   // Content arriving outside a prompt we initiated gets no "Working…" spinner.
@@ -571,8 +666,9 @@ function handleUpdate(params) {
     case "tool_call": {
       sealTextBlock(turn);
       sealThought(turn);
-      const card = document.createElement("div");
+      const card = document.createElement("details");
       card.className = "tool-call";
+      const summary = document.createElement("summary");
       const status = document.createElement("span");
       status.className = `tool-status ${update.status || "pending"}`;
       const title = document.createElement("span");
@@ -582,12 +678,25 @@ function handleUpdate(params) {
       kind.textContent = update.kind || "tool";
       title.appendChild(kind);
       title.appendChild(document.createTextNode(update.title || ""));
-      card.appendChild(status);
-      card.appendChild(title);
+      const caret = document.createElement("span");
+      caret.className = "tool-caret hidden";
+      caret.textContent = "▶";
+      summary.appendChild(status);
+      summary.appendChild(title);
+      summary.appendChild(caret);
+      card.appendChild(summary);
+      const body = document.createElement("div");
+      body.className = "tool-body hidden";
+      card.appendChild(body);
       turn.container.insertBefore(card, turn.spinner);
-      if (update.toolCallId) {
-        turn.toolCards.set(update.toolCallId, { statusEl: status, titleEl: title, kindEl: kind });
+
+      const entry = { statusEl: status, titleEl: title, kindEl: kind, body, caret };
+      if (update.content?.length) {
+        renderToolContent(body, update.content);
+        body.classList.remove("hidden");
+        caret.classList.remove("hidden");
       }
+      if (update.toolCallId) turn.toolCards.set(update.toolCallId, entry);
       break;
     }
     case "tool_call_update": {
@@ -598,6 +707,11 @@ function handleUpdate(params) {
           card.titleEl.textContent = "";
           card.titleEl.appendChild(card.kindEl);
           card.titleEl.appendChild(document.createTextNode(update.title));
+        }
+        if (update.content?.length) {
+          renderToolContent(card.body, update.content);
+          card.body.classList.remove("hidden");
+          card.caret.classList.remove("hidden");
         }
       }
       break;
@@ -683,20 +797,319 @@ client.onPermissionRequest = (params) =>
     overlay.classList.remove("hidden");
   });
 
+// ============================ USAGE ============================
+
+const TICKS_PER_USD = 1e10;
+
+function addUsage(chat, u) {
+  if (!u || typeof u !== "object") return;
+  const s = chat.usage;
+  s.input += u.inputTokens || 0;
+  s.output += u.outputTokens || 0;
+  s.turns += u.numTurns || 0;
+  s.calls += u.modelCalls || 0;
+  if (u.costUsdTicks != null) s.costTicks += u.costUsdTicks;
+  else if ((u.inputTokens || 0) + (u.outputTokens || 0) > 0) s.costTrusted = false;
+  if (u.usageIsIncomplete) s.costTrusted = false;
+  updateUsageChip();
+}
+
+function fmtTokens(n) {
+  if (n < 1000) return String(n);
+  if (n < 1e6) return (n / 1e3).toFixed(1) + "k";
+  return (n / 1e6).toFixed(2) + "M";
+}
+
+function fmtUsd(x) {
+  if (x > 0 && x < 0.01) return "<$0.01";
+  return "$" + x.toFixed(2);
+}
+
+function updateUsageChip() {
+  const s = state.activeChat?.usage;
+  const label = $("usage-label");
+  if (!s || s.input + s.output === 0) {
+    label.textContent = "Usage";
+    return;
+  }
+  let text = `${fmtTokens(s.input + s.output)} tok`;
+  if (s.costTicks > 0 && s.costTrusted) text += ` · ${fmtUsd(s.costTicks / TICKS_PER_USD)}`;
+  label.textContent = text;
+}
+
+$("usage-btn").addEventListener("click", openUsage);
+$("usage-close").addEventListener("click", () => $("usage-overlay").classList.add("hidden"));
+
+function usageStat(v, k) {
+  const div = document.createElement("div");
+  div.className = "usage-stat";
+  const vv = document.createElement("div");
+  vv.className = "v";
+  vv.textContent = v;
+  const kk = document.createElement("div");
+  kk.className = "k";
+  kk.textContent = k;
+  div.appendChild(vv);
+  div.appendChild(kk);
+  return div;
+}
+
+async function openUsage() {
+  $("usage-overlay").classList.remove("hidden");
+
+  // This chat.
+  const grid = $("usage-session");
+  grid.textContent = "";
+  const s = state.activeChat?.usage || emptyUsage();
+  grid.appendChild(usageStat(fmtTokens(s.input), "tokens in"));
+  grid.appendChild(usageStat(fmtTokens(s.output), "tokens out"));
+  grid.appendChild(usageStat(String(s.calls), "model calls"));
+  grid.appendChild(
+    usageStat(s.costTicks > 0 && s.costTrusted ? fmtUsd(s.costTicks / TICKS_PER_USD) : "—", "cost")
+  );
+
+  // Account/billing (cached for a minute).
+  const box = $("usage-account");
+  const tierEl = $("usage-tier");
+  const now = Date.now();
+  if (!state.billing || now - state.billing.at > 60_000) {
+    box.innerHTML = '<p class="muted small">Loading…</p>';
+    try {
+      const data = await client.billing();
+      state.billing = { at: now, data };
+    } catch (err) {
+      state.billing = { at: now, error: String(err.message || err) };
+    }
+  }
+  renderBilling(box, tierEl, state.billing);
+}
+
+function renderBilling(box, tierEl, billing) {
+  box.textContent = "";
+  tierEl.classList.add("hidden");
+
+  if (billing.error) {
+    const p = document.createElement("p");
+    p.className = "muted small";
+    p.textContent = `Plan usage isn't available right now (${billing.error}).`;
+    box.appendChild(p);
+    return;
+  }
+
+  const resp = billing.data || {};
+  const cfg = resp.config || {};
+
+  if (resp.subscriptionTier) {
+    tierEl.textContent = resp.subscriptionTier;
+    tierEl.classList.remove("hidden");
+  }
+
+  const cents = (c) => (c && typeof c.val === "number" ? c.val / 100 : null);
+
+  // Included-credit progress.
+  let pct = cfg.creditUsagePercent;
+  const used = cents(cfg.used);
+  const limit = cents(cfg.monthlyLimit);
+  if (pct == null && used != null && limit != null && limit > 0) pct = (used / limit) * 100;
+
+  if (pct != null) {
+    const label = document.createElement("div");
+    label.className = "usage-row";
+    label.innerHTML = "<span>Included credits used</span>";
+    const r = document.createElement("span");
+    r.className = "r";
+    r.textContent = `${Math.round(pct)}%`;
+    label.appendChild(r);
+    box.appendChild(label);
+
+    const bar = document.createElement("div");
+    bar.className = "credit-bar";
+    const fill = document.createElement("div");
+    fill.style.width = `${Math.min(100, Math.max(0, pct))}%`;
+    if (pct >= 90) fill.className = "hot";
+    bar.appendChild(fill);
+    box.appendChild(bar);
+  }
+
+  const rows = [];
+  const period = cfg.currentPeriod || {};
+  const end = period.end || cfg.billingPeriodEnd;
+  if (end) {
+    const d = new Date(end);
+    if (!isNaN(d)) rows.push(["Resets", d.toLocaleDateString(undefined, { month: "short", day: "numeric" })]);
+  }
+  const odUsed = cents(cfg.onDemandUsed);
+  const odCap = cents(cfg.onDemandCap);
+  if (resp.onDemandEnabled !== false && (odUsed != null || odCap != null)) {
+    rows.push([
+      "On-demand",
+      `${odUsed != null ? fmtUsd(odUsed) : "$0.00"}${odCap != null && odCap > 0 ? ` of ${fmtUsd(odCap)}` : ""}`,
+    ]);
+  }
+  const prepaid = cents(cfg.prepaidBalance);
+  if (prepaid != null && prepaid > 0) rows.push(["Credit balance", fmtUsd(prepaid)]);
+
+  for (const [k, v] of rows) {
+    const row = document.createElement("div");
+    row.className = "usage-row";
+    const kk = document.createElement("span");
+    kk.textContent = k;
+    const vv = document.createElement("span");
+    vv.className = "r";
+    vv.textContent = v;
+    row.appendChild(kk);
+    row.appendChild(vv);
+    box.appendChild(row);
+  }
+
+  if (!box.childElementCount) {
+    const p = document.createElement("p");
+    p.className = "muted small";
+    p.textContent = "No plan usage reported for this account.";
+    box.appendChild(p);
+  }
+}
+
+// ============================ MODEL PICKER ============================
+
+function updateModelLabel() {
+  const chat = state.activeChat;
+  const current = chat?.models?.currentModelId;
+  $("model-label").textContent = current || prefs.model || "Default model";
+}
+
+$("model-btn").addEventListener("click", (e) => {
+  e.stopPropagation();
+  const menu = $("model-menu");
+  if (!menu.classList.contains("hidden")) {
+    menu.classList.add("hidden");
+    return;
+  }
+  const chat = state.activeChat;
+  const models = chat?.models?.availableModels || [];
+  menu.textContent = "";
+
+  if (!models.length) {
+    const item = document.createElement("button");
+    item.className = "menu-item";
+    item.textContent = "No other models available";
+    item.disabled = true;
+    menu.appendChild(item);
+  } else {
+    for (const m of models) {
+      const id = m.modelId || m.id || String(m);
+      const name = m.name || id;
+      const item = document.createElement("button");
+      item.className = "menu-item";
+      if (id === chat.models.currentModelId) item.classList.add("selected");
+      const label = document.createElement("span");
+      label.textContent = name;
+      const mark = document.createElement("span");
+      mark.className = "check-mark";
+      mark.textContent = "✓";
+      item.appendChild(label);
+      item.appendChild(mark);
+      item.addEventListener("click", async () => {
+        menu.classList.add("hidden");
+        try {
+          await client.setModel(chat.sessionId, id);
+          chat.models.currentModelId = id;
+          updateModelLabel();
+          toast(`Model set to ${name}`);
+        } catch (err) {
+          toast(`Couldn't switch model: ${err.message || err}`);
+        }
+      });
+      menu.appendChild(item);
+    }
+  }
+  menu.classList.remove("hidden");
+});
+$("model-menu").addEventListener("click", (e) => e.stopPropagation());
+
+// ============================ SLASH COMMANDS ============================
+
+const slash = { items: [], active: 0 };
+
+function slashQuery() {
+  const v = $("prompt-input").value;
+  if (!v.startsWith("/") || /\s/.test(v)) return null;
+  return v.slice(1).toLowerCase();
+}
+
+function updateSlashMenu() {
+  const q = slashQuery();
+  const menu = $("slash-menu");
+  if (q === null || !state.commands.length) {
+    hideSlashMenu();
+    return;
+  }
+  slash.items = state.commands.filter((c) => c.name.toLowerCase().startsWith(q));
+  if (!slash.items.length) {
+    hideSlashMenu();
+    return;
+  }
+  slash.active = Math.min(slash.active, slash.items.length - 1);
+  menu.textContent = "";
+  slash.items.forEach((c, i) => {
+    const btn = document.createElement("button");
+    btn.className = "slash-item" + (i === slash.active ? " active" : "");
+    const name = document.createElement("span");
+    name.className = "slash-name";
+    name.textContent = `/${c.name}`;
+    const desc = document.createElement("span");
+    desc.className = "slash-desc";
+    desc.textContent = c.description || "";
+    btn.appendChild(name);
+    btn.appendChild(desc);
+    btn.addEventListener("mousedown", (e) => {
+      e.preventDefault();
+      pickSlash(i);
+    });
+    menu.appendChild(btn);
+  });
+  menu.classList.remove("hidden");
+}
+
+function hideSlashMenu() {
+  $("slash-menu").classList.add("hidden");
+  slash.items = [];
+  slash.active = 0;
+}
+
+function pickSlash(i) {
+  const c = slash.items[i];
+  if (!c) return;
+  const input = $("prompt-input");
+  input.value = `/${c.name} `;
+  hideSlashMenu();
+  input.focus();
+  autosize(input);
+}
+
 // ============================ COMPOSER ============================
 
 function updateComposer() {
   const busy = !!state.activeChat?.busy;
+  const gated = !state.folder;
   $("send-btn").classList.toggle("hidden", busy);
   $("stop-btn").classList.toggle("hidden", !busy);
+  const input = $("prompt-input");
+  input.disabled = gated;
+  input.placeholder = gated
+    ? "Open a project folder to start…"
+    : "Ask Grok to build, fix, or explain something…";
+  $("composer-inner").classList.toggle("disabled", gated);
+  $("send-btn").disabled = gated;
 }
 
 async function sendPrompt() {
   const input = $("prompt-input");
   const text = input.value.trim();
   const chat = state.activeChat;
-  if (!text || !chat || chat.busy) return;
+  if (!text || !chat || chat.busy || !state.folder) return;
 
+  hideSlashMenu();
   input.value = "";
   autosize(input);
 
@@ -711,7 +1124,8 @@ async function sendPrompt() {
   updateComposer();
 
   try {
-    await client.prompt(chat.sessionId, text);
+    const result = await client.prompt(chat.sessionId, text);
+    addUsage(chat, result?._meta?.usage);
   } catch (err) {
     const note = document.createElement("div");
     note.className = "error-note";
@@ -741,19 +1155,39 @@ $("stop-btn").addEventListener("click", () => {
   const chat = state.activeChat;
   if (chat?.busy) client.cancel(chat.sessionId);
 });
+
 $("prompt-input").addEventListener("keydown", (e) => {
+  if (slash.items.length) {
+    if (e.key === "ArrowDown") {
+      e.preventDefault();
+      slash.active = (slash.active + 1) % slash.items.length;
+      updateSlashMenu();
+      return;
+    }
+    if (e.key === "ArrowUp") {
+      e.preventDefault();
+      slash.active = (slash.active - 1 + slash.items.length) % slash.items.length;
+      updateSlashMenu();
+      return;
+    }
+    if (e.key === "Tab" || (e.key === "Enter" && !e.shiftKey)) {
+      e.preventDefault();
+      pickSlash(slash.active);
+      return;
+    }
+    if (e.key === "Escape") {
+      hideSlashMenu();
+      return;
+    }
+  }
   if (e.key === "Enter" && !e.shiftKey) {
     e.preventDefault();
     sendPrompt();
   }
 });
-$("prompt-input").addEventListener("input", (e) => autosize(e.target));
-
-// ============================ MODEL MENU (placeholder single) ============================
-
-$("model-btn").addEventListener("click", (e) => {
-  e.stopPropagation();
-  openSettings(); // model is edited in settings for now
+$("prompt-input").addEventListener("input", (e) => {
+  autosize(e.target);
+  updateSlashMenu();
 });
 
 // ============================ AGENT LIFECYCLE ============================
