@@ -488,11 +488,23 @@ function makeChatShell(sessionId, folder, title) {
   };
 }
 
+function isEmptyChat(c) {
+  return !c.busy && c.el.childElementCount === 0;
+}
+
 async function newChat() {
   if (!state.folder) {
     updateEmptyState();
     return;
   }
+  // An untouched chat for this project IS a new chat — reuse it instead of
+  // stacking "New chat" clutter in the sidebar.
+  const empty = state.chats.find((c) => c.folder === state.folder && isEmptyChat(c));
+  if (empty) {
+    switchChat(empty);
+    return;
+  }
+
   let session;
   try {
     session = await client.newSession(state.folder);
@@ -546,6 +558,14 @@ async function resumeSession(stored) {
 
 function switchChat(chat) {
   state.activeChat = chat;
+  // Garbage-collect abandoned empty chats: switching away from an untouched
+  // chat discards it (its on-disk session is empty and filtered from lists).
+  for (const c of [...state.chats]) {
+    if (c !== chat && isEmptyChat(c)) {
+      c.el.remove();
+      state.chats.splice(state.chats.indexOf(c), 1);
+    }
+  }
   for (const c of state.chats) {
     c.el.style.display = c === chat ? "" : "none";
   }
@@ -588,6 +608,9 @@ function timeLabel(iso) {
   return d.toLocaleDateString(undefined, { month: "short", year: "numeric" });
 }
 
+// Sidebar caps: at most this many rows per project (open chats always shown;
+// stored history fills the remainder).
+const MAX_ROWS_PER_PROJECT = 8;
 const STORED_PER_PROJECT = 6;
 
 function renderSidebar() {
@@ -624,10 +647,14 @@ function renderSidebar() {
 
     const entries = groups.get(cwd);
     const openEntries = entries.filter((e) => e.open);
+    const storedCap = Math.min(
+      STORED_PER_PROJECT,
+      Math.max(0, MAX_ROWS_PER_PROJECT - openEntries.length)
+    );
     const storedEntries = entries
       .filter((e) => e.stored)
       .sort((a, b) => b.at - a.at)
-      .slice(0, STORED_PER_PROJECT);
+      .slice(0, storedCap);
 
     for (const e of openEntries) {
       const item = document.createElement("div");
@@ -832,6 +859,11 @@ function handleUpdate(params) {
 
   // Replayed user turns (session/load restores the whole transcript).
   if (update.sessionUpdate === "user_message_chunk") {
+    // During a live turn the agent echoes the prompt we already rendered
+    // locally — drawing it again duplicates the user's message. Only render
+    // user chunks outside our own turns (i.e. session/load replay).
+    if (chat.busy) return;
+    if (update.content?._meta?.hideFromScrollback || update._meta?.hideFromScrollback) return;
     const text = contentText(update.content);
     if (!text) return;
     // A user message ends any open agent turn.
