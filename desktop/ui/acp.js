@@ -108,6 +108,16 @@ export class AgentClient {
     this._send({ jsonrpc: "2.0", method: "session/cancel", params: { sessionId } });
   }
 
+  async setModel(sessionId, modelId) {
+    return await this.request("session/set_model", { sessionId, modelId });
+  }
+
+  // Slash commands advertised by the agent (initialize._meta.availableCommands,
+  // refreshed by available_commands_update session updates).
+  availableCommands() {
+    return this.initializeResult?._meta?.availableCommands || [];
+  }
+
   // Fire the ACP `authenticate` request. Returns the promise WITHOUT awaiting
   // here so the caller can poll the auth URL concurrently (the request blocks
   // until the whole login flow finishes).
@@ -146,6 +156,7 @@ export class AgentClient {
   submitAuthCode(code) { return this.ext("x.ai/auth/submit_code", { code }); }
   setApiKey(key) { return this.ext("x.ai/setApiKey", { key }); }
   logout(scope) { return this.ext("x.ai/auth/logout", { scope: scope ?? null }); }
+  billing() { return this.ext("x.ai/billing", {}); }
 
   // ---- transport ----
 
