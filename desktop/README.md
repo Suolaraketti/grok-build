@@ -2,10 +2,26 @@
 
 A downloadable desktop app for [Grok Build](../README.md) — a chat-style GUI
 (in the spirit of the ChatGPT / Codex desktop apps) instead of the terminal
-TUI. Pick a project folder, chat with the agent, watch it think, see every
-tool call it makes, and approve or deny actions from a dialog.
+TUI. Sign in with your Grok account, pick a project folder, chat with the
+agent, watch it think, see every tool call it makes, and approve or deny
+actions from a dialog.
 
-![architecture](#architecture)
+## Signing in
+
+The app signs you in **without ever touching a terminal**, using the agent's
+`x.ai/auth/*` ACP extension:
+
+- **Sign in with Grok** — opens your browser for the standard xAI OAuth
+  (loopback) flow. Approve in the browser and the app completes automatically;
+  a paste-code fallback covers browsers that can't redirect back.
+- **Use an API key** — paste an `xai-…` key from
+  [console.x.ai](https://console.x.ai) instead.
+- **Already signed in** — if you've logged in before (here or via the `grok`
+  CLI), or `XAI_API_KEY` is set, the app authenticates silently on launch and
+  drops you straight into a chat.
+
+Credentials live in `~/.grok`, shared with the CLI. Sign out from the account
+menu in the sidebar.
 
 ## How it works
 

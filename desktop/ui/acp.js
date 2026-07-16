@@ -1,15 +1,23 @@
-// Minimal ACP (Agent Client Protocol) client over the Tauri transport.
+// ACP (Agent Client Protocol) client over the Tauri transport.
 //
 // The Rust backend spawns `grok agent stdio` and forwards newline-delimited
-// JSON-RPC both ways: we call the `send_to_agent` command to write, and
-// receive every agent stdout line via the `acp:line` event. This module owns
-// request ids, pending-response bookkeeping, and dispatch of agent-initiated
-// requests/notifications to app-provided handlers.
+// JSON-RPC both ways: we call `send_to_agent` to write, and receive every
+// agent stdout line via the `acp:line` event. This module owns request ids,
+// pending-response bookkeeping, dispatch of agent-initiated requests, and the
+// xAI auth extension methods (`x.ai/auth/*`).
 
 "use strict";
 
 const { invoke } = window.__TAURI__.core;
 const { listen } = window.__TAURI__.event;
+
+// Auth method ids advertised by the agent (see xai-grok-shell auth_method.rs).
+export const METHOD = {
+  API_KEY: "xai.api_key",
+  CACHED_TOKEN: "cached_token",
+  GROK_COM: "grok.com",
+  OIDC: "oidc",
+};
 
 export class AgentClient {
   constructor() {
@@ -17,6 +25,7 @@ export class AgentClient {
     this.nextId = 1;
     this.pending = new Map(); // id -> {resolve, reject}
     this.initializeResult = null;
+    this.authMethods = [];
     this.binaryPath = null;
 
     // App-provided handlers.
@@ -47,8 +56,7 @@ export class AgentClient {
     );
   }
 
-  // Spawn (or respawn) the agent process and run the ACP initialize
-  // handshake. Returns the initialize result.
+  // Spawn (or respawn) the agent and run the ACP initialize handshake.
   async start({ model = null, alwaysApprove = false } = {}) {
     await this._setupListeners();
     this._failAllPending("agent restarted");
@@ -60,14 +68,12 @@ export class AgentClient {
     this.initializeResult = await this.request("initialize", {
       protocolVersion: 1,
       clientCapabilities: {
-        // The agent uses its own filesystem/terminal implementations; this
-        // client intentionally advertises none so it never has to answer
-        // fs/terminal callbacks.
         fs: { readTextFile: false, writeTextFile: false },
         terminal: false,
       },
       clientInfo: { name: "grok-build-desktop", version: "0.1.0" },
     });
+    this.authMethods = this.initializeResult.authMethods || [];
     return this.initializeResult;
   }
 
@@ -76,12 +82,21 @@ export class AgentClient {
     await invoke("stop_agent");
   }
 
+  hasAuthMethod(id) {
+    return this.authMethods.some((m) => m.id === id);
+  }
+
+  // The interactive (browser) login method the agent advertises, if any.
+  interactiveMethod() {
+    return this.authMethods.find((m) => m.id === METHOD.GROK_COM || m.id === METHOD.OIDC) || null;
+  }
+
+  // ---- ACP core ----
+
   async newSession(cwd) {
     return await this.request("session/new", { cwd, mcpServers: [] });
   }
 
-  // Send a user prompt; streamed content arrives via onSessionUpdate.
-  // Resolves with { stopReason } when the turn ends.
   async prompt(sessionId, text) {
     return await this.request("session/prompt", {
       sessionId,
@@ -92,6 +107,47 @@ export class AgentClient {
   cancel(sessionId) {
     this._send({ jsonrpc: "2.0", method: "session/cancel", params: { sessionId } });
   }
+
+  // Fire the ACP `authenticate` request. Returns the promise WITHOUT awaiting
+  // here so the caller can poll the auth URL concurrently (the request blocks
+  // until the whole login flow finishes).
+  authenticate(methodId, meta = {}) {
+    return this.request("authenticate", { methodId, _meta: meta });
+  }
+
+  // ---- xAI auth extension (x.ai/auth/*) ----
+  //
+  // ACP extension methods travel as a JSON-RPC method equal to the extension
+  // name prefixed with "_", with the params passed directly. Handlers that use
+  // `to_raw_response` (auth/info, get_url, submit_code) put the payload object
+  // straight in `result`; a few (setApiKey/getApiKey) double-wrap it under
+  // `result.result`, which `_unwrapExt` flattens.
+
+  async ext(method, params = {}) {
+    const result = await this.request(`_${method}`, params);
+    return this._unwrapExt(result);
+  }
+
+  _unwrapExt(result) {
+    if (result == null) return {};
+    // Flatten the ExtMethodResult `{ result: <payload> }` envelope when present.
+    if (
+      typeof result === "object" &&
+      result.result !== undefined &&
+      Object.keys(result).length === 1
+    ) {
+      return result.result ?? {};
+    }
+    return result;
+  }
+
+  authInfo() { return this.ext("x.ai/auth/info"); }
+  getAuthUrl() { return this.ext("x.ai/auth/get_url"); }
+  submitAuthCode(code) { return this.ext("x.ai/auth/submit_code", { code }); }
+  setApiKey(key) { return this.ext("x.ai/setApiKey", { key }); }
+  logout(scope) { return this.ext("x.ai/auth/logout", { scope: scope ?? null }); }
+
+  // ---- transport ----
 
   request(method, params) {
     const id = this.nextId++;
@@ -113,9 +169,7 @@ export class AgentClient {
   }
 
   _failAllPending(reason) {
-    for (const { reject } of this.pending.values()) {
-      reject(new Error(reason));
-    }
+    for (const { reject } of this.pending.values()) reject(new Error(reason));
     this.pending.clear();
   }
 
@@ -175,18 +229,9 @@ export class AgentClient {
   }
 }
 
-export async function agentBinaryInfo() {
-  return await invoke("agent_binary_info");
-}
+// ---- Tauri command wrappers ----
 
-export async function pickFolder() {
-  return await invoke("pick_folder");
-}
-
-export async function homeDir() {
-  return await invoke("home_dir");
-}
-
-export async function openExternal(url) {
-  return await invoke("open_external", { url });
-}
+export async function agentBinaryInfo() { return await invoke("agent_binary_info"); }
+export async function pickFolder() { return await invoke("pick_folder"); }
+export async function homeDir() { return await invoke("home_dir"); }
+export async function openExternal(url) { return await invoke("open_external", { url }); }
