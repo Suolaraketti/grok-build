@@ -30,6 +30,7 @@ export class AgentClient {
 
     // App-provided handlers.
     this.onSessionUpdate = () => {};
+    this.onSessionNotification = () => {}; // x.ai/session_notification (retries, compaction, ...)
     this.onPermissionRequest = async () => ({ outcome: "cancelled" });
     this.onExit = () => {};
     this.onStderr = () => {};
@@ -218,6 +219,12 @@ export class AgentClient {
     // Notification.
     if (msg.method === "session/update" || msg.method === "x.ai/session/update") {
       this.onSessionUpdate(msg.params);
+    } else if (
+      msg.method === "_x.ai/session_notification" ||
+      msg.method === "x.ai/session_notification"
+    ) {
+      // Session-level side channel: retry/backoff state, auto-compaction, etc.
+      this.onSessionNotification(msg.params);
     }
   }
 
