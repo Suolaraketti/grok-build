@@ -72,7 +72,7 @@ export class AgentClient {
         fs: { readTextFile: false, writeTextFile: false },
         terminal: false,
       },
-      clientInfo: { name: "grok-build-desktop", version: "1.0.0" },
+      clientInfo: { name: "grok-build-desktop", version: "1.0.1" },
     });
     this.authMethods = this.initializeResult.authMethods || [];
     return this.initializeResult;
