@@ -7,7 +7,7 @@
 
 "use strict";
 
-import { AgentClient, METHOD, agentBinaryInfo, pickFolder, homeDir, openExternal } from "./acp.js";
+import { AgentClient, METHOD, agentBinaryInfo, pickFolder, homeDir, listStoredSessions, openExternal } from "./acp.js";
 import { renderMarkdown } from "./markdown.js";
 
 const $ = (id) => document.getElementById(id);
@@ -32,6 +32,7 @@ const state = {
   authSeq: 0,
   commands: [], // slash commands advertised by the agent
   billing: null, // {at, data|error}
+  stored: [], // past sessions from ~/.grok/sessions (via list_sessions)
 };
 
 const SUGGESTIONS = [
@@ -295,10 +296,27 @@ async function enterApp() {
   updateFolderLabel();
   updateModelLabel();
   populateSuggestions();
+  await refreshStored();
   if (state.folder && !state.chats.length) await newChat();
   updateEmptyState();
   updateComposer();
   $("prompt-input").focus();
+}
+
+async function refreshStored() {
+  try {
+    state.stored = (await listStoredSessions(120)) || [];
+  } catch {
+    state.stored = [];
+  }
+  if (!Array.isArray(state.stored)) state.stored = [];
+  renderSidebar();
+}
+
+let storedRefreshTimer = null;
+function scheduleStoredRefresh() {
+  clearTimeout(storedRefreshTimer);
+  storedRefreshTimer = setTimeout(refreshStored, 2500);
 }
 
 async function refreshAccount() {
@@ -371,6 +389,7 @@ $("menu-signout").addEventListener("click", async () => {
   state.chats = [];
   state.activeChat = null;
   state.billing = null;
+  state.stored = [];
   $("transcripts").textContent = "";
   $("chat-list").textContent = "";
   presentSignin();
@@ -410,7 +429,9 @@ async function chooseFolder() {
     try {
       const session = await client.newSession(picked);
       chat.sessionId = session.sessionId;
+      chat.folder = picked;
       applySessionInfo(chat, session);
+      renderSidebar();
     } catch (err) {
       toast(`Couldn't open folder: ${err.message || err}`);
     }
@@ -448,6 +469,25 @@ function emptyUsage() {
   return { input: 0, output: 0, costTicks: 0, costTrusted: true, turns: 0, calls: 0 };
 }
 
+function makeChatShell(sessionId, folder, title) {
+  const el = document.createElement("div");
+  el.className = "transcript";
+  $("transcripts").appendChild(el);
+  return {
+    sessionId,
+    title,
+    el,
+    turn: null,
+    busy: false,
+    models: null,
+    usage: emptyUsage(),
+    folder,
+    lastAt: new Date().toISOString(),
+    _userBubble: null,
+    _userBuf: "",
+  };
+}
+
 async function newChat() {
   if (!state.folder) {
     updateEmptyState();
@@ -461,38 +501,61 @@ async function newChat() {
     return;
   }
 
-  const el = document.createElement("div");
-  el.className = "transcript";
-  $("transcripts").appendChild(el);
-
-  const item = document.createElement("div");
-  item.className = "chat-item";
-  item.textContent = "New chat";
-
-  const chat = {
-    sessionId: session.sessionId,
-    title: "New chat",
-    el,
-    titleEl: item,
-    turn: null,
-    busy: false,
-    models: null,
-    usage: emptyUsage(),
-    folder: state.folder,
-  };
+  const chat = makeChatShell(session.sessionId, state.folder, "New chat");
   applySessionInfo(chat, session);
-  item.addEventListener("click", () => switchChat(chat));
-  $("chat-list").prepend(item);
   state.chats.push(chat);
   switchChat(chat);
+}
+
+// Reopen a stored session: the agent reloads its context and replays the
+// whole transcript as session/update notifications before load resolves.
+async function resumeSession(stored) {
+  const existing = state.chats.find((c) => c.sessionId === stored.sessionId);
+  if (existing) {
+    switchChat(existing);
+    return;
+  }
+
+  const chat = makeChatShell(
+    stored.sessionId,
+    stored.cwd,
+    stored.title || "Untitled chat"
+  );
+  chat.lastAt = stored.updatedAt || chat.lastAt;
+  if (stored.modelId) chat.models = { currentModelId: stored.modelId, availableModels: [] };
+  state.chats.push(chat);
+  switchChat(chat);
+
+  beginTurn(chat, true);
+  setTurnStatus(chat, "Restoring conversation…");
+  try {
+    const result = await client.loadSession(stored.sessionId, stored.cwd);
+    if (result?.models) {
+      chat.models = result.models;
+      updateModelLabel();
+    }
+  } catch (err) {
+    appendErrorNote(chat, `Couldn't restore this conversation: ${err.message || err}`);
+  } finally {
+    endTurn(chat);
+    renderSidebar();
+    updateEmptyState();
+    scrollToBottom();
+  }
 }
 
 function switchChat(chat) {
   state.activeChat = chat;
   for (const c of state.chats) {
     c.el.style.display = c === chat ? "" : "none";
-    c.titleEl.classList.toggle("active", c === chat);
   }
+  // A chat's project becomes the active project (new chats target it).
+  if (chat.folder && chat.folder !== state.folder) {
+    state.folder = chat.folder;
+    prefs.folder = chat.folder;
+    updateFolderLabel();
+  }
+  renderSidebar();
   updateComposer();
   updateEmptyState();
   updateModelLabel();
@@ -508,6 +571,89 @@ $("new-chat").addEventListener("click", () => {
   if (!state.folder) { chooseFolder(); return; }
   newChat();
 });
+
+// ---- sidebar: chats grouped by project folder ----
+
+function projectName(cwd) {
+  const parts = String(cwd || "").split(/[\\/]/).filter(Boolean);
+  return parts[parts.length - 1] || cwd || "unknown";
+}
+
+function timeLabel(iso) {
+  const d = new Date(iso);
+  if (isNaN(d)) return "";
+  const days = (Date.now() - d.getTime()) / 86400000;
+  if (days < 1) return d.toLocaleTimeString(undefined, { hour: "numeric", minute: "2-digit" });
+  if (days < 180) return d.toLocaleDateString(undefined, { month: "short", day: "numeric" });
+  return d.toLocaleDateString(undefined, { month: "short", year: "numeric" });
+}
+
+const STORED_PER_PROJECT = 6;
+
+function renderSidebar() {
+  const nav = $("chat-list");
+  nav.textContent = "";
+
+  const openIds = new Set(state.chats.map((c) => c.sessionId));
+  const groups = new Map(); // cwd -> entries
+  const add = (cwd, entry) => {
+    if (!groups.has(cwd)) groups.set(cwd, []);
+    groups.get(cwd).push(entry);
+  };
+  for (const c of state.chats) add(c.folder, { open: c, at: Date.parse(c.lastAt) || 0 });
+  for (const s of state.stored) {
+    if (openIds.has(s.sessionId)) continue;
+    add(s.cwd, { stored: s, at: Date.parse(s.updatedAt) || 0 });
+  }
+
+  const latest = (cwd) => Math.max(0, ...groups.get(cwd).map((e) => e.at));
+  const keys = [...groups.keys()].sort((a, b) => {
+    if (a === state.folder) return -1;
+    if (b === state.folder) return 1;
+    return latest(b) - latest(a);
+  });
+
+  for (const cwd of keys) {
+    const wrap = document.createElement("div");
+    wrap.className = "project-group";
+    const head = document.createElement("div");
+    head.className = "project-head";
+    head.textContent = projectName(cwd);
+    head.title = cwd;
+    wrap.appendChild(head);
+
+    const entries = groups.get(cwd);
+    const openEntries = entries.filter((e) => e.open);
+    const storedEntries = entries
+      .filter((e) => e.stored)
+      .sort((a, b) => b.at - a.at)
+      .slice(0, STORED_PER_PROJECT);
+
+    for (const e of openEntries) {
+      const item = document.createElement("div");
+      item.className = "chat-item" + (e.open === state.activeChat ? " active" : "");
+      item.textContent = e.open.title;
+      item.addEventListener("click", () => switchChat(e.open));
+      wrap.appendChild(item);
+    }
+    for (const e of storedEntries) {
+      const item = document.createElement("div");
+      item.className = "chat-item stored";
+      const label = document.createElement("span");
+      label.className = "chat-title";
+      label.textContent = e.stored.title || "Untitled chat";
+      const time = document.createElement("span");
+      time.className = "chat-time";
+      time.textContent = timeLabel(e.stored.updatedAt);
+      item.appendChild(label);
+      item.appendChild(time);
+      item.addEventListener("click", () => resumeSession(e.stored));
+      wrap.appendChild(item);
+    }
+
+    nav.appendChild(wrap);
+  }
+}
 
 function updateEmptyState() {
   const chat = state.activeChat;
@@ -612,6 +758,8 @@ function endTurn(chat) {
   chat.turn = null;
   chat.busy = false;
   updateComposer();
+  // Titles/summaries update on disk after a turn; refresh the sidebar soon.
+  scheduleStoredRefresh();
 }
 
 function sealTextBlock(turn) { turn.mdDiv = null; turn.textBuf = ""; }
@@ -681,7 +829,40 @@ function handleUpdate(params) {
 
   const chat = chatBySession(params.sessionId);
   if (!chat) return;
+
+  // Replayed user turns (session/load restores the whole transcript).
+  if (update.sessionUpdate === "user_message_chunk") {
+    const text = contentText(update.content);
+    if (!text) return;
+    // A user message ends any open agent turn.
+    if (chat.turn) {
+      chat.turn.spinner.remove();
+      chat.turn = null;
+    }
+    if (chat._userBubble) {
+      chat._userBuf += text;
+      chat._userBubble.textContent = chat._userBuf;
+    } else {
+      const wrap = document.createElement("div");
+      wrap.className = "msg msg-user";
+      const bubble = document.createElement("div");
+      bubble.className = "bubble";
+      bubble.textContent = text;
+      wrap.appendChild(bubble);
+      chat.el.appendChild(wrap);
+      chat._userBubble = bubble;
+      chat._userBuf = text;
+    }
+    updateEmptyState();
+    scrollToBottom();
+    return;
+  }
+
   if (!TURN_CONTENT.has(update.sessionUpdate)) return;
+
+  // Any agent content closes the current merged user bubble.
+  chat._userBubble = null;
+  chat._userBuf = "";
 
   // Content arriving outside a prompt we initiated gets no "Working…" spinner.
   if (!chat.turn) beginTurn(chat, chat.busy);
@@ -1231,7 +1412,9 @@ function pickSlash(i) {
 
 function updateComposer() {
   const busy = !!state.activeChat?.busy;
-  const gated = !state.folder;
+  // Usable whenever a chat is active (a resumed chat carries its own folder);
+  // otherwise gated until a project folder is opened.
+  const gated = !state.activeChat && !state.folder;
   $("send-btn").classList.toggle("hidden", busy);
   $("stop-btn").classList.toggle("hidden", !busy);
   const input = $("prompt-input");
@@ -1247,7 +1430,7 @@ async function sendPrompt() {
   const input = $("prompt-input");
   const text = input.value.trim();
   const chat = state.activeChat;
-  if (!text || !chat || chat.busy || !state.folder) return;
+  if (!text || !chat || chat.busy) return;
 
   hideSlashMenu();
   input.value = "";
@@ -1255,8 +1438,9 @@ async function sendPrompt() {
 
   if (chat.title === "New chat") {
     chat.title = text.length > 42 ? `${text.slice(0, 42)}…` : text;
-    chat.titleEl.textContent = chat.title;
   }
+  chat.lastAt = new Date().toISOString();
+  renderSidebar();
 
   addUserMessage(chat, text);
   beginTurn(chat);
