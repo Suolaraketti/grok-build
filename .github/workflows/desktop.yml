@@ -37,6 +37,11 @@ jobs:
 
     runs-on: ${{ matrix.os }}
 
+    env:
+      # True when Apple Developer credentials are configured as repo secrets;
+      # gates the signed macOS build path (see desktop/README.md).
+      MAC_SIGNING: ${{ secrets.APPLE_SIGNING_IDENTITY != '' }}
+
     steps:
       - uses: actions/checkout@v4
 
@@ -75,9 +80,24 @@ jobs:
       - name: Install Tauri CLI
         run: npm install -g @tauri-apps/cli@^2
 
+      # Two build steps so missing Apple secrets can never break the build:
+      # empty signing env vars would make Tauri attempt (and fail) signing.
       - name: Build desktop bundles
+        if: runner.os != 'macOS' || env.MAC_SIGNING != 'true'
         working-directory: desktop/src-tauri
         run: tauri build
+
+      - name: Build desktop bundles (signed + notarized)
+        if: runner.os == 'macOS' && env.MAC_SIGNING == 'true'
+        working-directory: desktop/src-tauri
+        run: tauri build
+        env:
+          APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
+          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+          APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
 
       - name: Upload artifacts
         uses: actions/upload-artifact@v4
