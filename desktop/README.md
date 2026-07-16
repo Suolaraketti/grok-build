@@ -101,7 +101,7 @@ and on `desktop-v*` tags:
 
 | Platform | Bundles |
 |----------|---------|
-| macOS (Apple Silicon + Intel) | `.dmg` |
+| macOS (Apple Silicon + Intel via `macos-15-intel`) | `.dmg` |
 | Windows | `.msi`, NSIS `.exe` |
 | Linux | `.deb`, `.rpm`, `.AppImage` |
 
