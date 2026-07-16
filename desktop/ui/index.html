@@ -1,0 +1,194 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Grok Build</title>
+  <link rel="stylesheet" href="style.css" />
+</head>
+<body>
+  <!-- ============================ BOOT ============================ -->
+  <section id="boot" class="screen center">
+    <div class="boot-inner">
+      <div class="brand-mark xl">/</div>
+      <div class="boot-spinner"></div>
+      <div id="boot-text" class="muted small">Starting Grok Build…</div>
+    </div>
+  </section>
+
+  <!-- ============================ SIGN IN ============================ -->
+  <section id="signin" class="screen center hidden">
+    <div class="signin-card">
+      <div class="brand-mark xl center-self">/</div>
+      <h1>Welcome to Grok Build</h1>
+      <p class="muted">SpaceXAI's AI coding agent, on your desktop. Sign in to get started.</p>
+
+      <div id="signin-error" class="banner banner-error hidden"></div>
+
+      <button id="signin-oauth" class="btn btn-primary btn-block btn-lg">
+        <span id="signin-oauth-label">Sign in with Grok</span>
+      </button>
+
+      <button id="signin-apikey-toggle" class="linkbtn">Use an API key instead</button>
+
+      <div id="apikey-panel" class="apikey-panel hidden">
+        <label class="field">
+          <span>xAI API key</span>
+          <input id="apikey-input" type="password" placeholder="xai-…" spellcheck="false" autocomplete="off" />
+        </label>
+        <button id="signin-apikey-submit" class="btn btn-block">Continue</button>
+        <p class="muted small">
+          Get a key at <a href="https://console.x.ai" data-external>console.x.ai</a>.
+        </p>
+      </div>
+
+      <p class="signin-foot muted small">
+        By continuing you agree to xAI's terms. Your credentials are stored locally in
+        <code>~/.grok</code>, shared with the <code>grok</code> CLI.
+      </p>
+    </div>
+  </section>
+
+  <!-- ============================ AUTHENTICATING ============================ -->
+  <section id="authing" class="screen center hidden">
+    <div class="signin-card">
+      <div class="boot-spinner"></div>
+      <h2 id="authing-title">Signing you in…</h2>
+      <p id="authing-desc" class="muted">
+        We opened your browser to finish signing in. Come back here once you're done.
+      </p>
+
+      <div id="authing-device" class="device-box hidden">
+        <span class="muted small">Enter this code in your browser:</span>
+        <div id="authing-device-code" class="device-code"></div>
+      </div>
+
+      <button id="authing-open" class="btn btn-block hidden">Open the sign-in page again</button>
+
+      <details id="authing-paste" class="paste-details hidden">
+        <summary>Browser didn't open, or finished on another device?</summary>
+        <div class="paste-body">
+          <p class="muted small">Paste the sign-in URL below, then paste the code it gives you here:</p>
+          <div id="authing-url" class="url-box"></div>
+          <div class="row">
+            <input id="authing-code-input" type="text" placeholder="Paste code…" spellcheck="false" />
+            <button id="authing-code-submit" class="btn">Submit</button>
+          </div>
+        </div>
+      </details>
+
+      <button id="authing-cancel" class="linkbtn">Cancel</button>
+    </div>
+  </section>
+
+  <!-- ============================ APP ============================ -->
+  <div id="app" class="hidden">
+    <aside id="sidebar">
+      <div class="sidebar-head">
+        <button id="new-chat" class="btn btn-newchat" title="New chat">
+          <svg viewBox="0 0 16 16" width="15" height="15" aria-hidden="true"><path fill="currentColor" d="M8 2.5a.75.75 0 0 1 .75.75v4h4a.75.75 0 0 1 0 1.5h-4v4a.75.75 0 0 1-1.5 0v-4h-4a.75.75 0 0 1 0-1.5h4v-4A.75.75 0 0 1 8 2.5Z"/></svg>
+          New chat
+        </button>
+      </div>
+      <nav id="chat-list" aria-label="Chats"></nav>
+      <div class="sidebar-foot">
+        <button id="account-btn" class="account" title="Account">
+          <span id="account-avatar" class="avatar">?</span>
+          <span class="account-meta">
+            <span id="account-name" class="account-name">Signed in</span>
+            <span id="account-sub" class="account-sub muted"></span>
+          </span>
+          <svg class="account-chevron" viewBox="0 0 16 16" width="14" height="14" aria-hidden="true"><path fill="currentColor" d="M4.5 6.5 8 10l3.5-3.5"/></svg>
+        </button>
+        <div id="account-menu" class="account-menu hidden">
+          <button id="menu-settings" class="menu-item">Agent settings</button>
+          <button id="menu-signout" class="menu-item menu-danger">Sign out</button>
+        </div>
+      </div>
+    </aside>
+
+    <main id="main">
+      <header id="topbar">
+        <button id="folder-btn" class="chip" title="Project folder">
+          <svg viewBox="0 0 16 16" width="14" height="14" aria-hidden="true"><path fill="currentColor" d="M1.75 3.5A1.75 1.75 0 0 1 3.5 1.75h2.4c.46 0 .9.18 1.24.51l.9.9h4.71c.97 0 1.75.78 1.75 1.75v6.83c0 .97-.78 1.75-1.75 1.75h-9.5A1.75 1.75 0 0 1 1.5 11.74V3.5Z"/></svg>
+          <span id="folder-label">Open a folder</span>
+        </button>
+        <div class="topbar-spacer"></div>
+        <button id="model-btn" class="chip" title="Model">
+          <span id="model-label">Default model</span>
+          <svg viewBox="0 0 16 16" width="12" height="12" aria-hidden="true"><path fill="currentColor" d="M4.5 6.5 8 10l3.5-3.5"/></svg>
+        </button>
+        <div id="model-menu" class="menu-pop hidden"></div>
+      </header>
+
+      <section id="chat-area" class="panel">
+        <div id="transcripts"></div>
+
+        <div id="empty-state" class="empty-state">
+          <div class="brand-mark xl">/</div>
+          <h2>What are we building?</h2>
+          <p class="muted">Grok reads your code, edits files, and runs commands — with your approval.</p>
+          <div id="empty-folder-cta" class="empty-cta hidden">
+            <button id="empty-open-folder" class="btn btn-primary">Open a project folder</button>
+            <p class="muted small">Pick the project you want Grok to work in.</p>
+          </div>
+          <div id="empty-suggestions" class="suggestions"></div>
+        </div>
+
+        <div id="composer">
+          <div id="composer-inner">
+            <textarea id="prompt-input" rows="1"
+              placeholder="Ask Grok to build, fix, or explain something…"></textarea>
+            <div class="composer-actions">
+              <button id="send-btn" class="iconbtn iconbtn-send" title="Send (Enter)" aria-label="Send">
+                <svg viewBox="0 0 16 16" width="16" height="16"><path fill="currentColor" d="M8 14a.75.75 0 0 1-.75-.75V4.56L4.03 7.78a.75.75 0 0 1-1.06-1.06l4.5-4.5a.75.75 0 0 1 1.06 0l4.5 4.5a.75.75 0 1 1-1.06 1.06L8.75 4.56v8.69A.75.75 0 0 1 8 14Z"/></svg>
+              </button>
+              <button id="stop-btn" class="iconbtn iconbtn-stop hidden" title="Stop" aria-label="Stop">
+                <svg viewBox="0 0 16 16" width="14" height="14"><rect x="3" y="3" width="10" height="10" rx="2" fill="currentColor"/></svg>
+              </button>
+            </div>
+          </div>
+          <div id="composer-hint" class="muted small">Enter to send · Shift+Enter for a new line</div>
+        </div>
+      </section>
+    </main>
+  </div>
+
+  <!-- ============================ PERMISSION MODAL ============================ -->
+  <div id="perm-overlay" class="overlay hidden" role="dialog" aria-modal="true">
+    <div class="modal">
+      <div class="modal-head">
+        <span class="modal-badge">Permission</span>
+        <h2 id="perm-title">Grok wants to run an action</h2>
+      </div>
+      <div id="perm-body"></div>
+      <div id="perm-options" class="perm-options"></div>
+    </div>
+  </div>
+
+  <!-- ============================ SETTINGS MODAL ============================ -->
+  <div id="settings-overlay" class="overlay hidden" role="dialog" aria-modal="true">
+    <div class="modal">
+      <div class="modal-head">
+        <h2>Agent settings</h2>
+      </div>
+      <label class="check">
+        <input id="set-yolo" type="checkbox" />
+        <span>Auto-approve tool actions <span class="muted">(skip permission prompts — use with care)</span></span>
+      </label>
+      <label class="field">
+        <span>Default model <span class="muted">(optional)</span></span>
+        <input id="set-model" type="text" placeholder="e.g. grok-build" spellcheck="false" />
+      </label>
+      <p class="muted small">Changes to the model or auto-approve take effect on the next new chat.</p>
+      <div class="perm-options">
+        <button id="settings-close" class="btn btn-primary">Done</button>
+      </div>
+    </div>
+  </div>
+
+  <div id="toast" class="toast hidden"></div>
+
+  <script type="module" src="main.js"></script>
+</body>
+</html>
