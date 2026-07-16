@@ -5,6 +5,23 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::{fs, iter};
 
+/// Return the dependency list portion of a Makefile-style protoc `--dependency_out` line.
+///
+/// Skips a leading Windows drive letter (`C:`) so `C:\temp\out.pb: dep.proto` is
+/// split on the target/deps separator, not the drive colon.
+fn makefile_dep_rest(line: &str) -> Option<&str> {
+    let bytes = line.as_bytes();
+    let search_from =
+        if bytes.len() >= 2 && bytes[0].is_ascii_alphabetic() && bytes[1] == b':' {
+            2
+        } else {
+            0
+        };
+    line[search_from..]
+        .find(':')
+        .map(|idx| &line[search_from + idx + 1..])
+}
+
 /// Find the protoc well-known types include directory.
 ///
 /// When PROTOC is set (e.g., in Bazel), the include directory is typically
@@ -114,22 +131,24 @@ impl XaiProtoBuilder {
 
         // Can only process one input file when using --dependency_out=FILE.
         // Use temp files instead of /dev/stdout and /dev/null so this works on
-        // Windows (those Unix device paths are not available there).
+        // Windows (those Unix device paths are not available there). Create the
+        // paths under a TempDir and leave the files closed so protoc can write
+        // them on Windows (exclusive locks on open NamedTempFile handles).
         for proto in protos {
-            let dep_file = tempfile::NamedTempFile::new()
-                .context("failed to create temp dependency file")?;
-            let descriptor_file = tempfile::NamedTempFile::new()
-                .context("failed to create temp descriptor file")?;
+            let temp_dir =
+                tempfile::TempDir::new().context("failed to create temp dir for protoc")?;
+            let dep_path = temp_dir.path().join("deps");
+            let descriptor_path = temp_dir.path().join("out.pb");
 
             let mut command = Command::new(protoc.unwrap_or(Path::new("protoc")));
             command
                 .arg(format!(
                     "--dependency_out={}",
-                    dep_file.path().to_str().context("dep path not UTF-8")?
+                    dep_path.to_str().context("dep path not UTF-8")?
                 ))
                 .arg(format!(
                     "--descriptor_set_out={}",
-                    descriptor_file.path().to_str().context("fds path not UTF-8")?
+                    descriptor_path.to_str().context("fds path not UTF-8")?
                 ));
 
             // Add protoc's well-known types include directory first (if found).
@@ -156,18 +175,17 @@ impl XaiProtoBuilder {
                 return Err(anyhow::anyhow!("protoc command failed"));
             }
 
-            let output = fs::read_to_string(dep_file.path())
+            let output = fs::read_to_string(&dep_path)
                 .context("failed to read protoc dependency file")?;
 
-            // Makefile-style: "<descriptor_path>: dep1 dep2 \" then continuation lines.
+            // Makefile-style: "<descriptor_path>: dep1 dep2 \" then continuation
+            // lines. On Windows the target is an absolute path with a drive
+            // letter (`C:\...`), so we must not split on that first `:`.
             let mut lines = output.lines();
             let first_line = lines.next().context("protoc dependency file is empty")?;
-            let rem = first_line
-                .split_once(':')
-                .map(|(_, rest)| rest)
-                .with_context(|| {
-                    format!("protoc dependency file must contain ':': {output:?}")
-                })?;
+            let rem = makefile_dep_rest(first_line).with_context(|| {
+                format!("protoc dependency file must contain target ':': {output:?}")
+            })?;
             for line in iter::once(rem).chain(lines) {
                 let line = line.trim();
                 let line = line.strip_suffix('\\').unwrap_or(line).trim();
@@ -182,7 +200,9 @@ impl XaiProtoBuilder {
                     continue;
                 }
 
-                if !fs::exists(line)? {
+                if !fs::exists(line).with_context(|| {
+                    format!("failed to check dependency path exists: {line:?}")
+                })? {
                     return Err(anyhow::anyhow!("dependency file not found: {line}"));
                 }
 
@@ -306,5 +326,31 @@ pub fn configure() -> XaiProtoBuilder {
         pbjson_ignore_unknown_fields: false,
         pbjson_preserve_proto_field_names: false,
         file_descriptor_set_path: None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::makefile_dep_rest;
+
+    #[test]
+    fn makefile_dep_rest_unix_path() {
+        assert_eq!(
+            makefile_dep_rest("/tmp/out.pb: proto/a.proto proto/b.proto"),
+            Some(" proto/a.proto proto/b.proto")
+        );
+    }
+
+    #[test]
+    fn makefile_dep_rest_windows_drive_letter() {
+        assert_eq!(
+            makefile_dep_rest(r"C:\Users\runner\AppData\Local\Temp\out.pb: proto\a.proto"),
+            Some(r" proto\a.proto")
+        );
+    }
+
+    #[test]
+    fn makefile_dep_rest_missing_separator() {
+        assert_eq!(makefile_dep_rest(r"C:\Temp\out.pb"), None);
     }
 }
