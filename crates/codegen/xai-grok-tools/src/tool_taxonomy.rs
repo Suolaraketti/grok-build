@@ -68,6 +68,7 @@ impl ToolKind {
             ToolKind::UseTool => "Use Tool",
             ToolKind::Monitor => "Monitor",
             ToolKind::GoalUpdate => "Update Goal",
+            ToolKind::Workflow => "Workflow",
             ToolKind::Other => "Tool",
         }
     }
@@ -109,9 +110,50 @@ impl ToolKind {
             | ToolKind::UseTool
             | ToolKind::Monitor
             | ToolKind::GoalUpdate
+            | ToolKind::Workflow
             | ToolKind::Other => false,
         }
     }
+}
+/// First-party tool wire names whose argument streams are long enough for a
+/// writing-phase spinner label to be visible (file bodies, edit strings,
+/// shell scripts, prompts), paired with their [`ToolKind`].
+///
+/// Public so clients can pin that every entry gets non-fallback display copy
+/// — a spelling added here without client copy would otherwise silently keep
+/// the raw-name fallback.
+pub const WRITING_TOOL_WIRE_NAMES: &[(&str, ToolKind)] = &[
+    ("write", ToolKind::Write),
+    ("search_replace", ToolKind::Edit),
+    ("edit", ToolKind::Edit),
+    ("hashline_edit", ToolKind::Edit),
+    ("apply_patch", ToolKind::Edit),
+    ("run_terminal_command", ToolKind::Execute),
+    ("run_terminal_cmd", ToolKind::Execute),
+    ("bash", ToolKind::Execute),
+    ("todo_write", ToolKind::Plan),
+    ("todowrite", ToolKind::Plan),
+    ("workflow", ToolKind::Workflow),
+    ("image_gen", ToolKind::ImageGen),
+    ("image_edit", ToolKind::ImageGen),
+    ("image_to_video", ToolKind::ImageToVideo),
+    ("reference_to_video", ToolKind::ReferenceToVideo),
+    ("ask_user_question", ToolKind::AskUser),
+];
+/// [`ToolKind`] of a wire name in [`WRITING_TOOL_WIRE_NAMES`].
+///
+/// Keyed by wire name because that is all a client has while
+/// `tool_call_delta_chunk`s stream. Best-effort by design: wire names are
+/// client-renameable, so unknown names return `None` and callers fall back to
+/// showing the raw name. Not a general name→kind resolver — read-style tools
+/// with tiny argument payloads are deliberately absent, as are the MCP
+/// dispatch tools (`use_tool`/`search_tool`), which clients special-case by
+/// name constant.
+pub fn writing_tool_kind(wire_name: &str) -> Option<ToolKind> {
+    WRITING_TOOL_WIRE_NAMES
+        .iter()
+        .find(|(name, _)| *name == wire_name)
+        .map(|&(_, kind)| kind)
 }
 impl schemars::JsonSchema for ToolKind {
     fn schema_name() -> Cow<'static, str> {
@@ -124,13 +166,14 @@ impl schemars::JsonSchema for ToolKind {
             .filter_map(|v| v.as_str().map(|s| format!("`{s}`")))
             .collect::<Vec<_>>()
             .join(", ");
-        schemars::json_schema!(
-            { "type" : "string", "description" :
-            format!("Categorizes what a tool does at a high level. Open set — consumers must \
+        schemars::json_schema!({
+            "type": "string",
+            "description": format!(
+                "Categorizes what a tool does at a high level. Open set — consumers must \
                  tolerate unknown values (Rust deserializes them to `other` via \
-                 `#[serde(other)]`). Known values: {known}."),
-            }
-        )
+                 `#[serde(other)]`). Known values: {known}."
+            ),
+        })
     }
 }
 /// Canonical identity for a tool call, resolved from a tool's registered
@@ -250,6 +293,50 @@ mod tests {
             read_only: kind.is_read_only(),
         }
     }
+    /// Every writing-visible spelling stays glued to its definition site:
+    /// the map must agree with the live tool's `id()` and metadata `kind()`.
+    #[test]
+    fn writing_tool_kind_matches_definition_sites() {
+        use crate::types::tool_metadata::ToolMetadata;
+        use xai_tool_runtime::Tool;
+        fn covered<T: Tool + ToolMetadata>(tool: T) {
+            assert_eq!(
+                writing_tool_kind(tool.id().as_str()),
+                Some(ToolMetadata::kind(&tool)),
+                "writing_tool_kind drifted for `{}`",
+                tool.id()
+            );
+        }
+        covered(crate::implementations::grok_build::SearchReplaceTool);
+        covered(crate::implementations::grok_build::BashTool);
+        covered(crate::implementations::grok_build::TodoWriteTool);
+        covered(crate::implementations::grok_build::WorkflowTool);
+        covered(crate::implementations::grok_build::ImageGenTool);
+        covered(crate::implementations::grok_build::ImageEditTool);
+        covered(crate::implementations::grok_build::ImageToVideoTool);
+        covered(crate::implementations::grok_build::ReferenceToVideoTool);
+        covered(crate::implementations::grok_build::AskUserQuestionTool);
+        covered(crate::implementations::opencode::OpenCodeWriteTool);
+        covered(crate::implementations::opencode::OpenCodeEditTool);
+        covered(crate::implementations::opencode::OpenCodeBashTool);
+        covered(crate::implementations::opencode::OpenCodeTodoWriteTool);
+        covered(crate::implementations::codex::ApplyPatchTool);
+        covered(crate::implementations::grok_build_hashline::HashlineEditTool);
+    }
+    /// Spellings with no instantiable definition site in this crate
+    /// (client-facing renames) and the deliberate absences.
+    #[test]
+    fn writing_tool_kind_renames_and_absences() {
+        assert_eq!(
+            writing_tool_kind("run_terminal_command"),
+            Some(ToolKind::Execute)
+        );
+        assert_eq!(writing_tool_kind("read_file"), None);
+        assert_eq!(writing_tool_kind("grep"), None);
+        assert_eq!(writing_tool_kind("list_dir"), None);
+        assert_eq!(writing_tool_kind(crate::USE_TOOL_NAME), None);
+        assert_eq!(writing_tool_kind(crate::SEARCH_TOOL_NAME), None);
+    }
     #[test]
     fn is_read_only_classifies_kinds() {
         assert!(ToolKind::Read.is_read_only());
@@ -311,7 +398,7 @@ mod tests {
         let meta = CanonicalToolMeta::new(
             "read_file",
             &identity(ToolKind::Read),
-            Some(serde_json::json!({ "path" : "/a" })),
+            Some(serde_json::json!({ "path": "/a" })),
         );
         let t = serde_json::to_value(&meta).unwrap();
         assert_eq!(t["version"], serde_json::json!(TOOL_META_VERSION));
@@ -345,7 +432,16 @@ mod tests {
         let mut expected: serde_json::Value =
             serde_json::from_str(tool_meta_json_schema_str()).expect("checked-in schema parses");
         if let Some(values) = expected["definitions"]["ToolNamespace"]["enum"].as_array_mut() {
-            values.retain(|v| v != "cursor");
+            use std::collections::HashSet;
+            use strum::IntoEnumIterator;
+            let compiled: HashSet<String> = ToolNamespace::iter()
+                .filter_map(|ns| {
+                    serde_json::to_value(ns)
+                        .ok()
+                        .and_then(|v| v.as_str().map(str::to_owned))
+                })
+                .collect();
+            values.retain(|v| matches!(v.as_str(), Some(s) if compiled.contains(s)));
         }
         let expected = format!("{}\n", serde_json::to_string_pretty(&expected).unwrap());
         assert_eq!(
@@ -356,7 +452,7 @@ mod tests {
     #[test]
     fn merge_into_nests_under_one_key_and_preserves_existing() {
         let meta = CanonicalToolMeta::new("run_terminal_cmd", &identity(ToolKind::Execute), None);
-        let merged = meta.merge_into(Some(serde_json::json!({ "bash_mode" : true })));
+        let merged = meta.merge_into(Some(serde_json::json!({"bash_mode": true})));
         let o = merged.as_object().unwrap();
         assert_eq!(o["bash_mode"], true, "existing meta must be preserved");
         let t = &o[TOOL_META_KEY];

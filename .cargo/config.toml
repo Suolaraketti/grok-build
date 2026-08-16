@@ -59,26 +59,10 @@ rustflags = [
 ]
 
 [target.x86_64-pc-windows-msvc]
-# /DEBUG:NONE: MSVC's PDB public-symbol limit (LNK4319) is hit linking the
-# grok agent. Unwind tables above still support panic backtraces.
-rustflags = [
-    "-C",
-    "force-unwind-tables=yes",
-    "-C",
-    "target-feature=+crt-static",
-    "-C",
-    "link-arg=/DEBUG:NONE",
-]
+rustflags = ["-C", "force-unwind-tables=yes", "-C", "target-feature=+crt-static"]
 
 [target.aarch64-pc-windows-msvc]
-rustflags = [
-    "-C",
-    "force-unwind-tables=yes",
-    "-C",
-    "target-feature=+crt-static",
-    "-C",
-    "link-arg=/DEBUG:NONE",
-]
+rustflags = ["-C", "force-unwind-tables=yes", "-C", "target-feature=+crt-static"]
 
 
 # jemalloc page size for Apple Silicon (macOS aarch64 uses 16KB pages = 2^14).

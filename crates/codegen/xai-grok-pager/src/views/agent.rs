@@ -127,6 +127,13 @@ pub struct AgentViewLayout {
     pub scrollback_content: Rect,
     /// Scrollbar track position (x coordinate).
     pub scrollbar_x: u16,
+    /// Timeline rail left edge (only meaningful when `timeline_width > 0`;
+    /// the rail's right edge lands on the scrollbar column, which the rail
+    /// replaces).
+    pub timeline_x: u16,
+    /// Columns reserved for the timeline rail (0 = rail hidden). Non-zero
+    /// also means the scrollbar does not render this frame.
+    pub timeline_width: u16,
 }
 impl AgentViewLayout {
     /// Compute layout from screen area, appearance config, prompt height,
@@ -144,11 +151,15 @@ impl AgentViewLayout {
     /// When `startup_warning_height` is 0, the startup warning area is omitted.
     /// `prompt_gap` is 0 or 1 — controls the gap row between turn status
     /// (or scrollback) and the prompt widget.
+    /// `timeline_width` reserves rail columns for the timeline sidebar in
+    /// place of the scrollbar (0 = hidden); it requires the scrollbar's
+    /// gutter geometry, so a disabled scrollbar forces it to 0.
     #[allow(clippy::too_many_arguments)]
     pub fn compute(
         area: Rect,
         layout_cfg: &LayoutConfig,
         scrollbar_cfg: &ScrollbarConfig,
+        timeline_width: u16,
         prompt_height: u16,
         tasks_height: u16,
         catalog_height: u16,
@@ -189,7 +200,9 @@ impl AgentViewLayout {
             bottom_vpad,
         ));
         let inner_area = outer_block.inner(area);
-        let mut constraints = vec![Constraint::Length(1)];
+        let mut constraints = vec![
+            Constraint::Length(1), // StatusBar
+        ];
         if startup_warning_height > 0 {
             constraints.push(Constraint::Length(startup_warning_height));
         }
@@ -348,7 +361,17 @@ impl AgentViewLayout {
         }
         let shortcuts = chunks[i];
         let scrollbar_x = area.right().saturating_sub(scrollbar_cfg.gap_right + 1);
-        let content_end_x = scrollbar_x.saturating_sub(scrollbar_cfg.gap_left);
+        let timeline_width = if scrollbar_cfg.enabled {
+            timeline_width
+        } else {
+            0
+        };
+        let timeline_x = (scrollbar_x + 1).saturating_sub(timeline_width);
+        let content_end_x = if timeline_width > 0 {
+            timeline_x.saturating_sub(scrollbar_cfg.gap_left)
+        } else {
+            scrollbar_x.saturating_sub(scrollbar_cfg.gap_left)
+        };
         let scrollback_right = scrollback.x + scrollback.width;
         let scrollback_content = if !scrollbar_cfg.enabled || content_end_x >= scrollback_right {
             scrollback
@@ -376,6 +399,8 @@ impl AgentViewLayout {
             shortcuts,
             scrollback_content,
             scrollbar_x,
+            timeline_x,
+            timeline_width,
         }
     }
     /// Inner area width (for prompt height computation before full layout).
@@ -545,6 +570,16 @@ pub fn render_hook_hover_popup(
     let Some(entry) = scrollback.get(hover_idx) else {
         return;
     };
+    let layout_info = scrollback
+        .get_cached_entry_layouts()
+        .and_then(|layouts| layouts.get(hover_idx));
+    if layout_info.is_some_and(|info| {
+        info.verb_group_header && !info.is_expanded_verb_header() && info.group_header_count > 1
+    }) {
+        return;
+    }
+    let is_expanded_verb_header =
+        layout_info.is_some_and(crate::scrollback::EntryLayoutInfo::is_expanded_verb_header);
     if entry.display_mode != crate::scrollback::types::DisplayMode::Collapsed {
         return;
     }
@@ -567,14 +602,19 @@ pub fn render_hook_hover_popup(
     if lines.is_empty() {
         return;
     }
-    let Some((entry_area, _, _)) = scrollback.entry_screen_area(hover_idx, scrollback_area) else {
+    let Some((entry_area, top_clipped, _)) =
+        scrollback.entry_screen_area(hover_idx, scrollback_area)
+    else {
         return;
     };
     let (mouse_col, mouse_row) = mouse_pos;
     if mouse_row < entry_area.y || mouse_row >= entry_area.y + entry_area.height {
         return;
     }
-    let badge_row = entry_area.y;
+    let badge_row = entry_area.y + u16::from(is_expanded_verb_header && !top_clipped);
+    if badge_row >= entry_area.y + entry_area.height {
+        return;
+    }
     let row_start = scrollback_area.x;
     let row_end = scrollback_area.x + scrollback_area.width;
     let row_text: String = (row_start..row_end)
@@ -640,7 +680,7 @@ pub fn render_hook_hover_popup(
         if y >= inner.y + inner.height {
             break;
         }
-        buf.set_line_safe(inner.x, y, &line.content, inner.width);
+        buf.set_line_safe_bidi(inner.x, y, &line.content, inner.width);
     }
 }
 /// Selection/hover chrome for a side pane (todo / queue / tasks). Focused panes get a dismiss control.
@@ -746,123 +786,9 @@ pub fn render_scrollbar(
         );
     }
 }
-use crate::appearance::TodoBadgeFormat;
-/// Build the todo badge as styled spans (without rendering).
-///
-/// Returns `None` if there are no items to display.
-pub fn render_todo_badge_spans(
-    counts: &super::todo_pane::TodoCounts,
-    hovered: bool,
-    flash: bool,
-    format: TodoBadgeFormat,
-    theme: &Theme,
-) -> Option<Vec<Span<'static>>> {
-    use ratatui::style::Modifier;
-    if counts.total() == 0 {
-        return None;
-    }
-    let highlighted = hovered || flash;
-    let count_style = if highlighted {
-        Style::default()
-            .fg(theme.text_primary)
-            .bg(theme.bg_base)
-            .add_modifier(Modifier::BOLD)
-    } else {
-        Style::default().fg(theme.text_secondary).bg(theme.bg_base)
-    };
-    let dim_style = if highlighted {
-        Style::default().fg(theme.text_secondary).bg(theme.bg_base)
-    } else {
-        Style::default().fg(theme.gray_dim).bg(theme.bg_base)
-    };
-    if matches!(format, TodoBadgeFormat::Default) {
-        let total = counts.total_excluding_cancelled();
-        if total == 0 {
-            return None;
-        }
-        return Some(vec![
-            Span::styled(counts.completed.to_string(), count_style),
-            Span::styled("/", dim_style),
-            Span::styled(total.to_string(), count_style),
-            Span::styled(
-                format!(" {}", crate::glyphs::check_mark()),
-                Style::default().fg(theme.text_secondary).bg(theme.bg_base),
-            ),
-        ]);
-    }
-    let icon_mod = if highlighted {
-        Modifier::BOLD
-    } else {
-        Modifier::empty()
-    };
-    let statuses: [(usize, &str, ratatui::style::Color); 4] = [
-        (counts.in_progress, "▶", theme.warning),
-        (counts.pending, "□", theme.text_secondary),
-        (
-            counts.completed,
-            crate::glyphs::check_mark(),
-            theme.accent_success,
-        ),
-        (
-            counts.cancelled,
-            crate::glyphs::ballot_x(),
-            theme.accent_error,
-        ),
-    ];
-    let parts: Vec<(usize, &str, ratatui::style::Color)> =
-        statuses.into_iter().filter(|(n, _, _)| *n > 0).collect();
-    if parts.is_empty() {
-        return None;
-    }
-    let mut spans: Vec<Span<'static>> = Vec::with_capacity(parts.len() * 4);
-    for (i, (count, icon, color)) in parts.iter().enumerate() {
-        let icon_style = Style::default()
-            .fg(*color)
-            .bg(theme.bg_base)
-            .add_modifier(icon_mod);
-        let num_style = match format {
-            TodoBadgeFormat::Default => {
-                let mut s = Style::default().fg(*color).bg(theme.bg_base);
-                if highlighted {
-                    s = s.add_modifier(Modifier::BOLD);
-                }
-                s
-            }
-            _ => count_style,
-        };
-        match format {
-            TodoBadgeFormat::Default => {
-                if i > 0 {
-                    spans.push(Span::styled(" ", dim_style));
-                }
-                spans.push(Span::styled(format!("{count}"), num_style));
-            }
-            TodoBadgeFormat::Colon => {
-                if i > 0 {
-                    spans.push(Span::styled(" ", dim_style));
-                }
-                spans.push(Span::styled(*icon, icon_style));
-                spans.push(Span::styled(":", dim_style));
-                spans.push(Span::styled(format!("{count}"), num_style));
-            }
-            TodoBadgeFormat::Comma => {
-                if i > 0 {
-                    spans.push(Span::styled(", ", dim_style));
-                }
-                spans.push(Span::styled(format!("{count}"), num_style));
-                spans.push(Span::styled(" ", dim_style));
-                spans.push(Span::styled(*icon, icon_style));
-            }
-        }
-    }
-    spans.push(Span::styled(
-        format!(" {}", crate::glyphs::check_mark()),
-        Style::default().fg(theme.text_secondary).bg(theme.bg_base),
-    ));
-    Some(spans)
-}
-/// Space:prompt hint — shared across multiple scrollback hint branches.
-fn space_prompt_hint() -> HintItem {
+/// The scrollback's default focus hint: `Space` leaves for the prompt. A
+/// parked blocking card replaces it with its own (pinned) route back.
+pub fn prompt_focus_hint() -> HintItem {
     use crate::input::key::KeyShortcut;
     use crossterm::event::{KeyCode, KeyModifiers};
     HintItem {
@@ -883,9 +809,15 @@ fn space_prompt_hint() -> HintItem {
 ///
 /// `group_header_label` ("expand"/"collapse") marks a selected group header;
 /// it replaces the fold and Enter:open hints with a single Enter toggle hint.
+///
+/// `focus_hint` is how the scrollback says the keyboard can leave it —
+/// [`prompt_focus_hint`], or a caller-supplied replacement. A pinned one
+/// leads the bar and is offered once; an unpinned one is offered only in the
+/// selection states where moving on is the useful next step.
 #[allow(clippy::too_many_arguments)]
 pub fn build_hints(
     active_pane: ActivePane,
+    focus_hint: HintItem,
     prompt: &PromptWidget,
     registry: &ActionRegistry,
     is_editing_queued: bool,
@@ -902,6 +834,7 @@ pub fn build_hints(
     vim_mode: bool,
     is_subagent_view: bool,
     is_turn_running: bool,
+    esc_would_cancel_turn: bool,
     has_queued_follow_up: bool,
     selected_is_user_prompt: bool,
     selected_is_agent_message: bool,
@@ -1046,6 +979,14 @@ pub fn build_hints(
         }
         ActivePane::Scrollback => {
             let mut hints = Vec::new();
+            if focus_hint.pinned {
+                hints.push(focus_hint.clone());
+            }
+            let offer_focus_hint = |hints: &mut Vec<HintItem>| {
+                if !focus_hint.pinned {
+                    hints.push(focus_hint.clone());
+                }
+            };
             let nothing_special = !selected_is_agent_message
                 && !selected_is_user_prompt
                 && !selected_is_credit_limit
@@ -1053,13 +994,13 @@ pub fn build_hints(
                 && group_header_label.is_none()
                 && !selected_supports_fullscreen;
             if nothing_special {
-                hints.push(space_prompt_hint());
+                offer_focus_hint(&mut hints);
             }
             if selected_is_credit_limit {
                 if let Some(key) = registry.key_for(ActionId::OpenBlockViewer) {
                     hints.push(HintItem::new(key, "open"));
                 }
-                hints.push(space_prompt_hint());
+                offer_focus_hint(&mut hints);
             }
             if selected_is_agent_message {
                 if vim_mode
@@ -1068,7 +1009,7 @@ pub fn build_hints(
                 {
                     hints.push(HintItem::new(key, "copy"));
                 }
-                hints.push(space_prompt_hint());
+                offer_focus_hint(&mut hints);
             }
             if selected_is_user_prompt {
                 let user_collapsed = fold_label == Some("expand");
@@ -1084,7 +1025,7 @@ pub fn build_hints(
                     hints.push(HintItem::new(key, thinking_label));
                 }
                 if !user_collapsed {
-                    hints.push(space_prompt_hint());
+                    offer_focus_hint(&mut hints);
                 }
             }
             let user_collapsed_already_pushed =
@@ -1126,9 +1067,7 @@ pub fn build_hints(
                     registry.key_for(ActionId::NextTurn),
                 )
             {
-                let mut hint = HintItem::paired(l, h, "turn").pinned();
-                hint.custom_display = Some("Shift+l/h");
-                hints.push(hint);
+                hints.push(HintItem::paired(l, h, "turn").pinned());
             }
             if !selected_is_user_prompt
                 && let Some(key) = registry.key_for(ActionId::ExpandAllThinking)
@@ -1166,7 +1105,11 @@ pub fn build_hints(
         }
     };
     if is_turn_running && let Some(def) = registry.find(ActionId::CancelTurn) {
-        hints.push(def.hint());
+        let mut hint = def.hint();
+        if esc_would_cancel_turn {
+            hint.keys = vec![crate::key!(Esc)];
+        }
+        hints.push(hint);
     }
     let has_composer_payload = !prompt.text().trim().is_empty() || is_editing_queued;
     if matches!(active_pane, ActivePane::Prompt)
@@ -1175,8 +1118,11 @@ pub fn build_hints(
     {
         hints.push(def.hint());
     }
-    if can_demote {
-        hints.push(HintItem::new(crate::key!('g', CONTROL), "send to bg"));
+    if can_demote
+        && !is_subagent_view
+        && let Some(key) = registry.key_for(ActionId::SendToBackground)
+    {
+        hints.push(HintItem::new(key, "send to bg"));
     }
     hints
 }
@@ -1216,6 +1162,7 @@ mod tests {
     ) -> Vec<HintItem> {
         build_hints(
             ActivePane::Scrollback,
+            prompt_focus_hint(),
             &PromptWidget::default(),
             registry,
             false,
@@ -1233,6 +1180,7 @@ mod tests {
             false,
             false,
             false,
+            false,
             selected_is_user_prompt,
             selected_is_agent_message,
             false,
@@ -1243,11 +1191,155 @@ mod tests {
     fn first_two_labels(hints: &[HintItem]) -> Vec<&str> {
         hints.iter().take(2).map(|h| h.label.as_ref()).collect()
     }
+    fn hooked_read_state(member_count: usize, viewport: Rect) -> ScrollbackState {
+        use crate::scrollback::RenderBlock;
+        use crate::scrollback::blocks::tool::{HookPhase, HookRunEntry, HookRunStatus};
+        crate::appearance::cache::set_group_tool_verbs(true);
+        crate::appearance::cache::set_show_thinking_blocks(false);
+        let mut state = ScrollbackState::new();
+        let first = state.push_block(RenderBlock::read("first.rs", None));
+        for i in 1..member_count {
+            state.push_block(RenderBlock::read(format!("member-{i}.rs"), None));
+        }
+        state.attach_hooks(
+            first,
+            HookPhase::Post,
+            vec![HookRunEntry {
+                name: "hover-hook".to_owned(),
+                status: HookRunStatus::Success {
+                    elapsed: std::time::Duration::from_millis(1),
+                },
+                output: None,
+            }],
+        );
+        state.prepare_layout(viewport.width, viewport.height);
+        state
+    }
+    fn render_hook_frame(state: &ScrollbackState, viewport: Rect) -> Buffer {
+        let layouts = state.get_cached_entry_layouts().expect("layout cache");
+        let entries = state.entries_in_range(0..state.len());
+        let mut buf = Buffer::empty(viewport);
+        crate::scrollback::render::render_scrolled_entries_with_scratch(
+            &mut buf,
+            viewport,
+            &entries,
+            0,
+            None,
+            &Theme::current(),
+            state.appearance(),
+            layouts,
+            0,
+            None,
+            None,
+            None,
+            0,
+            0,
+            &[],
+            Some((state.group_spans(), 0)),
+            state.cwd(),
+        );
+        buf
+    }
+    fn hover_hook_badge(buf: &mut Buffer, state: &ScrollbackState, viewport: Rect, row: u16) {
+        let row_text: String = (viewport.left()..viewport.right())
+            .map(|x| buf[(x, row)].symbol())
+            .collect();
+        let badge_col = viewport.x + row_text.find("[hooks:").expect("rendered hook badge") as u16;
+        render_hook_hover_popup(
+            buf,
+            viewport,
+            state,
+            Some(0),
+            (badge_col, row),
+            &Theme::current(),
+        );
+    }
+    fn frame_text(buf: &Buffer) -> String {
+        (buf.area.top()..buf.area.bottom())
+            .flat_map(|y| (buf.area.left()..buf.area.right()).map(move |x| buf[(x, y)].symbol()))
+            .collect()
+    }
+    #[test]
+    fn hook_hover_popup_allows_singleton_verb_header() {
+        let viewport = Rect::new(0, 0, 100, 12);
+        let state = hooked_read_state(1, viewport);
+        let layout = state.get_cached_entry_layouts().expect("layout cache")[0];
+        assert!(layout.verb_group_header);
+        assert_eq!(layout.group_header_count, 1);
+        assert!(!layout.is_expanded_verb_header());
+        let mut buf = render_hook_frame(&state, viewport);
+        hover_hook_badge(&mut buf, &state, viewport, 0);
+        assert!(frame_text(&buf).contains("hover-hook"));
+    }
+    #[test]
+    fn hook_hover_popup_allows_expanded_verb_member_zero() {
+        let viewport = Rect::new(0, 0, 100, 12);
+        let mut state = hooked_read_state(2, viewport);
+        state.set_selected(Some(0));
+        assert!(state.toggle_group_expansion());
+        state.set_selected(None);
+        state.prepare_layout(viewport.width, viewport.height);
+        assert!(
+            state.get_cached_entry_layouts().expect("layout cache")[0].is_expanded_verb_header()
+        );
+        let mut buf = render_hook_frame(&state, viewport);
+        hover_hook_badge(&mut buf, &state, viewport, 1);
+        assert!(frame_text(&buf).contains("hover-hook"));
+    }
+    #[test]
+    fn hook_hover_popup_skips_collapsed_multi_member_verb_header() {
+        let viewport = Rect::new(0, 0, 100, 12);
+        let state = hooked_read_state(2, viewport);
+        let layout = state.get_cached_entry_layouts().expect("layout cache")[0];
+        assert!(layout.verb_group_header);
+        assert_eq!(layout.group_header_count, 2);
+        assert!(!layout.is_expanded_verb_header());
+        let mut buf = render_hook_frame(&state, viewport);
+        hover_hook_badge(&mut buf, &state, viewport, 0);
+        assert!(!frame_text(&buf).contains("hover-hook"));
+    }
+    #[test]
+    fn demotion_hint_uses_registered_ctrl_b_binding() {
+        let registry = ActionRegistry::defaults();
+        let hints = build_hints(
+            ActivePane::Scrollback,
+            prompt_focus_hint(),
+            &PromptWidget::default(),
+            &registry,
+            false,
+            None,
+            None,
+            "expand thinking",
+            false,
+            false,
+            None,
+            false,
+            true,
+            false,
+            false,
+            true,
+            false,
+            false,
+            false,
+            false,
+            false,
+            false,
+            false,
+            false,
+            None,
+        );
+        let hint = hints
+            .iter()
+            .find(|hint| hint.label == "send to bg")
+            .expect("running Execute should advertise demotion");
+        assert_eq!(hint.keys, vec![crate::key!('b', CONTROL)]);
+    }
     #[test]
     fn group_header_shows_enter_toggle_hint_instead_of_open_and_fold() {
         let registry = ActionRegistry::defaults();
         let hints = build_hints(
             ActivePane::Scrollback,
+            prompt_focus_hint(),
             &PromptWidget::default(),
             &registry,
             false,
@@ -1262,6 +1354,7 @@ mod tests {
             false,
             false,
             true,
+            false,
             false,
             false,
             false,
@@ -1412,6 +1505,7 @@ mod tests {
         }
         build_hints(
             ActivePane::Scrollback,
+            prompt_focus_hint(),
             &PromptWidget::default(),
             registry,
             false,
@@ -1426,6 +1520,7 @@ mod tests {
             false,
             false,
             vim_mode,
+            false,
             false,
             false,
             false,
@@ -1515,6 +1610,7 @@ mod tests {
         let registry = ActionRegistry::defaults();
         let hints = build_hints(
             ActivePane::Prompt,
+            prompt_focus_hint(),
             &PromptWidget::default(),
             &registry,
             false,
@@ -1529,6 +1625,7 @@ mod tests {
             false,
             false,
             true,
+            false,
             false,
             false,
             false,
@@ -1559,6 +1656,7 @@ mod tests {
         let registry = ActionRegistry::defaults();
         build_hints(
             ActivePane::Prompt,
+            prompt_focus_hint(),
             &prompt,
             &registry,
             false,
@@ -1575,6 +1673,7 @@ mod tests {
             true,
             false,
             is_turn_running,
+            false,
             false,
             false,
             false,
@@ -1618,6 +1717,7 @@ mod tests {
             let registry = ActionRegistry::defaults();
             let hints = build_hints(
                 ActivePane::Prompt,
+                prompt_focus_hint(),
                 &prompt,
                 &registry,
                 false,
@@ -1634,6 +1734,7 @@ mod tests {
                 true,
                 false,
                 true,
+                false,
                 true,
                 false,
                 false,
@@ -1648,6 +1749,162 @@ mod tests {
                  (multiline={multiline}); got {labels:?}"
             );
         }
+    }
+    /// Running-turn cancel hint key tracks `esc_would_cancel_turn` — the
+    /// input-routing predicate computed by the caller: Esc when a bare press
+    /// would reach the policy's mid-turn cancel, the registry Ctrl+C binding
+    /// otherwise. (The predicate itself — gate, panes, and higher-priority
+    /// Esc consumers — is pinned by `esc_would_cancel_turn_tests` in
+    /// `agent_view::input`.)
+    #[test]
+    fn running_turn_cancel_hint_key_tracks_esc_predicate() {
+        let prompt = PromptWidget::default();
+        let registry = ActionRegistry::defaults();
+        for (esc_would_cancel_turn, expected) in
+            [(true, crate::key!(Esc)), (false, crate::key!('c', CONTROL))]
+        {
+            let hints = build_hints(
+                ActivePane::Prompt,
+                prompt_focus_hint(),
+                &prompt,
+                &registry,
+                false,
+                None,
+                None,
+                "expand thinking",
+                false,
+                false,
+                None,
+                false,
+                false,
+                false,
+                false,
+                true,
+                false,
+                true,
+                esc_would_cancel_turn,
+                false,
+                false,
+                false,
+                false,
+                false,
+                None,
+            );
+            let cancel = hints
+                .iter()
+                .find(|h| h.label == "cancel")
+                .expect("running turn must surface the cancel hint");
+            assert_eq!(
+                cancel.keys,
+                vec![expected],
+                "cancel hint key for esc_would_cancel_turn={esc_would_cancel_turn}"
+            );
+        }
+    }
+    /// Running turn + open scrollback search: the search's own `Esc cancel`
+    /// hint stays the ONLY Esc hint — the CancelTurn hint keeps Ctrl+C (the
+    /// caller's predicate is false while the search would steal Esc), so the
+    /// bar never shows two different `Esc cancel` meanings at once.
+    #[test]
+    fn running_turn_with_scrollback_search_keeps_ctrl_c_cancel_hint() {
+        let registry = ActionRegistry::defaults();
+        let search = ScrollbackSearchState::open();
+        let hints = build_hints(
+            ActivePane::Scrollback,
+            prompt_focus_hint(),
+            &PromptWidget::default(),
+            &registry,
+            false,
+            None,
+            None,
+            "expand thinking",
+            false,
+            false,
+            None,
+            false,
+            false,
+            false,
+            false,
+            false,
+            false,
+            true,
+            false,
+            false,
+            false,
+            false,
+            false,
+            false,
+            Some(&search),
+        );
+        let esc_cancels: Vec<&HintItem> = hints
+            .iter()
+            .filter(|h| h.label == "cancel" && h.keys == vec![crate::key!(Esc)])
+            .collect();
+        assert_eq!(
+            esc_cancels.len(),
+            1,
+            "exactly one Esc:cancel hint (the search's own dismiss)"
+        );
+        assert!(
+            hints
+                .iter()
+                .any(|h| h.label == "cancel" && h.keys == vec![crate::key!('c', CONTROL)]),
+            "CancelTurn hint must stay on Ctrl+C while the search owns Esc"
+        );
+    }
+    /// Running turn + editing a queued prompt: the edit's own `Esc cancel`
+    /// (discard) hint is the ONLY Esc-keyed row — the CancelTurn hint keeps
+    /// Ctrl+C (the caller's predicate is false while the edit owns Esc), so
+    /// the bar never shows two contradictory `Esc cancel` rows.
+    #[test]
+    fn running_turn_editing_queued_keeps_ctrl_c_cancel_hint() {
+        let registry = ActionRegistry::defaults();
+        let mut prompt = PromptWidget::default();
+        prompt.textarea.insert_str("edited row");
+        let hints = build_hints(
+            ActivePane::Prompt,
+            prompt_focus_hint(),
+            &prompt,
+            &registry,
+            true,
+            None,
+            None,
+            "expand thinking",
+            false,
+            false,
+            None,
+            false,
+            false,
+            false,
+            false,
+            false,
+            false,
+            true,
+            false,
+            false,
+            false,
+            false,
+            false,
+            false,
+            None,
+        );
+        let esc_rows: Vec<&HintItem> = hints
+            .iter()
+            .filter(|h| h.keys.contains(&crate::key!(Esc)))
+            .collect();
+        assert_eq!(
+            esc_rows.len(),
+            1,
+            "exactly one Esc-keyed hint (the edit's discard), got {:?}",
+            hints.iter().map(|h| h.label.as_ref()).collect::<Vec<_>>()
+        );
+        assert_eq!(esc_rows[0].label, "cancel");
+        assert!(
+            hints
+                .iter()
+                .any(|h| h.label == "cancel" && h.keys == vec![crate::key!('c', CONTROL)]),
+            "CancelTurn hint must stay on Ctrl+C while the edit owns Esc"
+        );
     }
     #[test]
     fn prompt_legacy_vte_adds_alt_enter_newline_hint() {
@@ -1735,6 +1992,7 @@ mod tests {
             area,
             &layout_cfg,
             &scrollbar_cfg,
+            0,
             2,
             0,
             0,
@@ -1754,6 +2012,67 @@ mod tests {
     }
     fn layout_with_cta(area: Rect, cta_height: u16) -> AgentViewLayout {
         layout_with_rows(area, 0, cta_height, 0)
+    }
+    /// Minimal layout with a timeline rail request — hides the cfg-dependent
+    /// arity of `compute` like `layout_with_rows` does.
+    fn layout_with_rail(
+        area: Rect,
+        timeline_width: u16,
+        scrollbar_cfg: &ScrollbarConfig,
+    ) -> AgentViewLayout {
+        let layout_cfg = LayoutConfig::default();
+        AgentViewLayout::compute(
+            area,
+            &layout_cfg,
+            scrollbar_cfg,
+            timeline_width,
+            2,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            1,
+            false,
+        )
+    }
+    #[test]
+    fn timeline_rail_replaces_the_scrollbar_column() {
+        let area = Rect::new(0, 0, 80, 40);
+        let scrollbar_cfg = ScrollbarConfig::default();
+        let without = layout_with_rail(area, 0, &scrollbar_cfg);
+        let with_rail = layout_with_rail(area, 3, &scrollbar_cfg);
+        assert_eq!(with_rail.timeline_width, 3);
+        assert_eq!(with_rail.scrollbar_x, without.scrollbar_x);
+        assert_eq!(with_rail.timeline_x, with_rail.scrollbar_x + 1 - 3);
+        assert!(
+            with_rail.scrollback_content.x + with_rail.scrollback_content.width
+                <= with_rail.timeline_x,
+            "content (ends {}) must not overlap the rail (starts {})",
+            with_rail.scrollback_content.x + with_rail.scrollback_content.width,
+            with_rail.timeline_x,
+        );
+        assert!(
+            with_rail.scrollback_content.width <= without.scrollback_content.width,
+            "the rail never widens the content"
+        );
+        let no_scrollbar = ScrollbarConfig {
+            enabled: false,
+            ..ScrollbarConfig::default()
+        };
+        let forced_off = layout_with_rail(area, 3, &no_scrollbar);
+        assert_eq!(forced_off.timeline_width, 0);
+        assert_eq!(
+            forced_off.scrollback_content.width, forced_off.scrollback.width,
+            "no carve-out without the scrollbar gutter"
+        );
     }
     #[test]
     fn plugin_cta_row_present_above_prompt() {
@@ -1897,75 +2216,5 @@ mod tests {
         let layout = layout_with_rows(area, 0, 0, 1);
         assert_eq!(layout.follow_ups, Rect::default());
         assert!(layout.scrollback.height >= 5);
-    }
-    /// Default todo badge is a `done/total` fraction: numerator = completed,
-    /// denominator = all tasks except cancelled.
-    #[test]
-    fn todo_badge_default_renders_done_over_total_fraction() {
-        let theme = Theme::current();
-        let counts = super::super::todo_pane::TodoCounts {
-            in_progress: 1,
-            pending: 2,
-            completed: 2,
-            cancelled: 0,
-        };
-        let spans =
-            render_todo_badge_spans(&counts, false, false, TodoBadgeFormat::Default, &theme)
-                .expect("badge renders when there are todos");
-        let text: String = spans.iter().map(|s| s.content.as_ref()).collect();
-        assert!(
-            text.starts_with("2/5"),
-            "expected a 2/5 done/total fraction, got {text:?}"
-        );
-        let with_cancelled = super::super::todo_pane::TodoCounts {
-            in_progress: 0,
-            pending: 1,
-            completed: 2,
-            cancelled: 1,
-        };
-        let spans = render_todo_badge_spans(
-            &with_cancelled,
-            false,
-            false,
-            TodoBadgeFormat::Default,
-            &theme,
-        )
-        .expect("badge renders");
-        let text: String = spans.iter().map(|s| s.content.as_ref()).collect();
-        assert!(
-            text.starts_with("2/3"),
-            "cancelled tasks are excluded from the total, got {text:?}"
-        );
-    }
-    /// No todos → no badge.
-    #[test]
-    fn todo_badge_absent_when_no_todos() {
-        let theme = Theme::current();
-        let empty = super::super::todo_pane::TodoCounts::default();
-        assert!(
-            render_todo_badge_spans(&empty, false, false, TodoBadgeFormat::Default, &theme)
-                .is_none()
-        );
-    }
-    /// All-cancelled list → no badge (denominator would be 0; nothing to track).
-    #[test]
-    fn todo_badge_absent_when_all_cancelled() {
-        let theme = Theme::current();
-        let all_cancelled = super::super::todo_pane::TodoCounts {
-            in_progress: 0,
-            pending: 0,
-            completed: 0,
-            cancelled: 3,
-        };
-        assert!(
-            render_todo_badge_spans(
-                &all_cancelled,
-                false,
-                false,
-                TodoBadgeFormat::Default,
-                &theme
-            )
-            .is_none()
-        );
     }
 }
