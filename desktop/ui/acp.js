@@ -8,6 +8,15 @@
 
 "use strict";
 
+import {
+  rpcIdKey,
+  unwrapAgentRequest,
+  isPermissionMethod,
+  isFolderTrustMethod,
+  isExitPlanMethod,
+  isAskUserQuestionMethod,
+} from "./protocol.js";
+
 const { invoke } = window.__TAURI__.core;
 const { listen } = window.__TAURI__.event;
 
@@ -32,6 +41,9 @@ export class AgentClient {
     this.onSessionUpdate = () => {};
     this.onSessionNotification = () => {}; // x.ai/session_notification (retries, compaction, ...)
     this.onPermissionRequest = async () => ({ outcome: "cancelled" });
+    this.onFolderTrustRequest = async () => ({ outcome: "trust" });
+    this.onExitPlanMode = async () => ({ outcome: "cancelled" });
+    this.onAskUserQuestion = async () => ({ outcome: "cancelled" });
     this.onYoloModeChanged = () => {};
     this.onExit = () => {};
     this.onStderr = () => {};
@@ -73,10 +85,12 @@ export class AgentClient {
         fs: { readTextFile: false, writeTextFile: false },
         terminal: false,
       },
-      clientInfo: { name: "grok-build-desktop", version: "1.0.1" },
+      clientInfo: { name: "grok-build-desktop", version: "1.1.1" },
       _meta: {
-        clientType: "grok-desktop",
+        // Wire name the agent deserializes as ClientType::Desktop (underscore).
+        clientType: "grok_desktop",
         clientIdentifier: "grok-desktop",
+        clientVersion: "1.1.1",
       },
     });
     this.authMethods = this.initializeResult.authMethods || [];
@@ -132,7 +146,15 @@ export class AgentClient {
       sessionId,
       prompt: [{ type: "text", text }],
     };
-    if (meta && Object.keys(meta).length) params._meta = meta;
+    // Only stamp _meta when there is a real mode/promptId — sending
+    // `{ mode: "default" }` on every turn is noise and some agents treat
+    // unknown mode strings more strictly than PromptMode::from_meta_str.
+    const cleaned = {};
+    if (meta && typeof meta === "object") {
+      if (meta.mode && meta.mode !== "default") cleaned.mode = meta.mode;
+      if (meta.promptId) cleaned.promptId = meta.promptId;
+    }
+    if (Object.keys(cleaned).length) params._meta = cleaned;
     return await this.request("session/prompt", params);
   }
 
@@ -208,7 +230,7 @@ export class AgentClient {
   request(method, params) {
     const id = this.nextId++;
     const promise = new Promise((resolve, reject) => {
-      this.pending.set(id, { resolve, reject });
+      this.pending.set(rpcIdKey(id), { resolve, reject });
     });
     this._send({ jsonrpc: "2.0", id, method, params });
     return promise;
@@ -216,9 +238,10 @@ export class AgentClient {
 
   _send(msg) {
     invoke("send_to_agent", { message: JSON.stringify(msg) }).catch((err) => {
-      const p = this.pending.get(msg.id);
+      const key = rpcIdKey(msg.id);
+      const p = this.pending.get(key);
       if (p) {
-        this.pending.delete(msg.id);
+        this.pending.delete(key);
         p.reject(new Error(String(err)));
       }
     });
@@ -238,11 +261,12 @@ export class AgentClient {
       return; // non-JSON noise on stdout
     }
 
-    // Response to one of our requests.
+    // Response to one of our requests. Coerce id so number 1 and "1" match.
     if (msg.id !== undefined && msg.method === undefined) {
-      const p = this.pending.get(msg.id);
+      const key = rpcIdKey(msg.id);
+      const p = this.pending.get(key);
       if (!p) return;
-      this.pending.delete(msg.id);
+      this.pending.delete(key);
       if (msg.error) {
         const err = new Error(msg.error.message || "agent error");
         err.code = msg.error.code;
@@ -278,13 +302,20 @@ export class AgentClient {
   }
 
   async _handleAgentRequest(msg) {
+    const { method, params } = unwrapAgentRequest(msg);
     let result = null;
     let error = null;
     try {
-      if (msg.method === "session/request_permission") {
-        result = { outcome: await this.onPermissionRequest(msg.params) };
+      if (isPermissionMethod(method)) {
+        result = { outcome: await this.onPermissionRequest(params) };
+      } else if (isFolderTrustMethod(method)) {
+        result = await this.onFolderTrustRequest(params);
+      } else if (isExitPlanMethod(method)) {
+        result = await this.onExitPlanMode(params);
+      } else if (isAskUserQuestionMethod(method)) {
+        result = await this.onAskUserQuestion(params);
       } else {
-        error = { code: -32601, message: `method not supported: ${msg.method}` };
+        error = { code: -32601, message: `method not supported: ${method}` };
       }
     } catch (e) {
       error = { code: -32603, message: String(e && e.message ? e.message : e) };

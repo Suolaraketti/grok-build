@@ -446,6 +446,7 @@ input:focus, textarea:focus {
   font-family: inherit;
 }
 .chip:hover { color: var(--text); background: var(--bg-2); }
+.chip.active { color: var(--text); background: var(--bg-3); border-color: var(--brand); }
 .chip svg { flex: none; opacity: 0.7; }
 .chip span { overflow: hidden; text-overflow: ellipsis; }
 
@@ -472,6 +473,16 @@ input:focus, textarea:focus {
 /* -------------------------------------------------------------- */
 
 .panel { flex: 1; display: flex; flex-direction: column; min-height: 0; position: relative; }
+
+/* Transcript pane is the only overlay host. Composer sits below it in the
+   flex column so welcome/empty UI can never steal Send clicks. */
+#chat-scroll {
+  flex: 1;
+  min-height: 0;
+  position: relative;
+  display: flex;
+  flex-direction: column;
+}
 
 #transcripts { flex: 1; overflow-y: auto; min-height: 0; }
 
@@ -612,10 +623,11 @@ details.thought .thought-body {
 /* empty state */
 .empty-state {
   position: absolute;
-  inset: 0 0 118px 0;
+  inset: 0;
   display: flex; flex-direction: column; align-items: center; justify-content: center;
   gap: 12px; text-align: center; padding: 24px;
   pointer-events: none;
+  overflow: auto;
 }
 .empty-state.hidden { display: none; }
 .empty-state > * { pointer-events: auto; }
@@ -816,7 +828,7 @@ details.tool-call[open] > summary .tool-caret { transform: rotate(90deg); }
 .jump-latest {
   position: absolute;
   left: 50%;
-  bottom: 118px;
+  bottom: 16px;
   transform: translateX(-50%);
   z-index: 6;
   background: var(--bg-2);
@@ -902,6 +914,16 @@ details.tool-call[open] > summary .tool-caret { transform: rotate(90deg); }
 
 /* composer disabled state */
 #composer-inner.disabled { opacity: 0.6; }
+
+.ask-list { display: flex; flex-direction: column; gap: 14px; }
+.ask-q { display: flex; flex-direction: column; gap: 8px; }
+.ask-h { font-weight: 600; }
+.ask-opts { display: flex; flex-wrap: wrap; gap: 8px; }
+.perm-pre {
+  white-space: pre-wrap; font-family: var(--mono); font-size: 12.5px;
+  background: var(--bg-2); border: 1px solid var(--border);
+  border-radius: var(--radius-sm); padding: 10px 12px; max-height: 280px; overflow: auto;
+}
 
 /* scrollbars */
 ::-webkit-scrollbar { width: 10px; height: 10px; }
