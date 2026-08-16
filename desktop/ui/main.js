@@ -712,7 +712,8 @@ function switchChat(chat) {
 }
 
 function chatBySession(sessionId) {
-  return state.chats.find((c) => c.sessionId === sessionId);
+  const id = sessionId == null ? "" : String(sessionId);
+  return state.chats.find((c) => String(c.sessionId) === id);
 }
 
 $("new-chat").addEventListener("click", () => {
@@ -1146,6 +1147,7 @@ const TURN_CONTENT = new Set([
 
 function handleUpdate(params) {
   const update = params.update ?? {};
+  const sessionId = params.sessionId || params.session_id;
 
   // Non-turn notifications we care about.
   if (update.sessionUpdate === "available_commands_update") {
@@ -1154,13 +1156,13 @@ function handleUpdate(params) {
   }
   if (update.sessionUpdate === "current_mode_update") {
     const modeId = update.currentModeId || update.current_mode_id || update.modeId;
-    const chat = chatBySession(params.sessionId);
+    const chat = chatBySession(sessionId);
     if (chat) chat.modeId = normalizeMode(modeId);
     if (chat && chat === state.activeChat) applyMode(modeId, { persist: true, notify: true });
     return;
   }
 
-  const chat = chatBySession(params.sessionId);
+  const chat = chatBySession(sessionId);
   if (!chat) return;
 
   // Replayed user turns (session/load restores the whole transcript).
@@ -1346,7 +1348,7 @@ client.onSessionUpdate = handleUpdate;
 // When the backend rate-limits, the agent retries with backoff instead of
 // failing the turn. Without surfacing retry_state the UI looks hung.
 client.onSessionNotification = (params) => {
-  const chat = chatBySession(params?.sessionId);
+  const chat = chatBySession(params?.sessionId || params?.session_id);
   if (!chat) return;
   const update = params.update || {};
 
@@ -1423,6 +1425,7 @@ function appendErrorNote(chat, msg) {
 let permQueue = Promise.resolve();
 let permPending = 0;
 let permDeny = null;
+let agentPromptCancel = null;
 
 const ENABLE_ALWAYS_APPROVE_ID = "enable-always-approve";
 
@@ -1436,6 +1439,148 @@ client.onPermissionRequest = (params) => {
   );
   return turn;
 };
+
+// Desktop reverse-requests. 1.1.0 advertised clientType Desktop; the agent
+// then sends folder-trust / plan-approval / ask-user-question RPCs. If we
+// reply "method not supported" the turn waits forever and Send looks dead.
+client.onFolderTrustRequest = async (params) => {
+  const cwd = params?.cwd || params?.workspace || "";
+  const kinds = (params?.configKinds || params?.config_kinds || []).join(", ");
+  const ok = await showAgentPrompt({
+    badge: "Folder trust",
+    title: "Trust this project folder?",
+    bodyHtml: `<p class="muted">Grok wants to load project-local config${kinds ? ` (${escapePrompt(kinds)})` : ""} from:</p><p><code>${escapePrompt(cwd)}</code></p><p class="muted small">You already opened this folder. Trust lets repo MCP servers, hooks, and plugins run.</p>`,
+    actions: [
+      { label: "Trust folder", cls: "btn btn-primary", result: { outcome: "trust" } },
+      { label: "Not now", cls: "btn", result: { outcome: "reject" } },
+    ],
+    cancel: { outcome: "reject" },
+  });
+  return ok;
+};
+
+client.onExitPlanMode = async (params) => {
+  const plan = params?.planContent || params?.plan_content || "";
+  const ok = await showAgentPrompt({
+    badge: "Plan",
+    title: "Approve this plan?",
+    bodyHtml: plan
+      ? `<pre class="perm-pre">${escapePrompt(plan)}</pre>`
+      : `<p class="muted">Grok finished planning and wants to start making changes.</p>`,
+    actions: [
+      { label: "Approve", cls: "btn btn-primary", result: { outcome: "approved" } },
+      { label: "Keep planning", cls: "btn", result: { outcome: "cancelled" } },
+    ],
+    cancel: { outcome: "cancelled" },
+  });
+  return ok;
+};
+
+client.onAskUserQuestion = async (params) => {
+  const questions = params?.questions || [];
+  const answers = {};
+  const body = document.createElement("div");
+  body.className = "ask-list";
+  for (const q of questions) {
+    const header = q.header || q.question || q.prompt || "Question";
+    const id = q.header || q.question || header;
+    const wrap = document.createElement("div");
+    wrap.className = "ask-q";
+    const h = document.createElement("div");
+    h.className = "ask-h";
+    h.textContent = header;
+    wrap.appendChild(h);
+    if (q.question && q.question !== header) {
+      const p = document.createElement("p");
+      p.className = "muted small";
+      p.textContent = q.question;
+      wrap.appendChild(p);
+    }
+    const opts = q.options || [];
+    if (opts.length) {
+      const row = document.createElement("div");
+      row.className = "ask-opts";
+      for (const opt of opts) {
+        const label = opt.label || opt.name || String(opt);
+        const btn = document.createElement("button");
+        btn.type = "button";
+        btn.className = "chip";
+        btn.textContent = label;
+        btn.addEventListener("click", () => {
+          answers[id] = [label];
+          for (const b of row.querySelectorAll("button")) b.classList.remove("active");
+          btn.classList.add("active");
+        });
+        row.appendChild(btn);
+      }
+      wrap.appendChild(row);
+    } else {
+      const input = document.createElement("input");
+      input.type = "text";
+      input.placeholder = "Your answer…";
+      input.addEventListener("input", () => {
+        const v = input.value.trim();
+        if (v) answers[id] = [v];
+        else delete answers[id];
+      });
+      wrap.appendChild(input);
+    }
+    body.appendChild(wrap);
+  }
+  const result = await showAgentPrompt({
+    badge: "Question",
+    title: questions.length > 1 ? "Grok has a few questions" : "Grok has a question",
+    bodyNode: body,
+    actions: [
+      { label: "Submit", cls: "btn btn-primary", result: "submit" },
+      { label: "Skip", cls: "btn", result: { outcome: "cancelled" } },
+    ],
+    cancel: { outcome: "cancelled" },
+  });
+  if (result === "submit") return { outcome: "accepted", answers };
+  return result;
+};
+
+function escapePrompt(s) {
+  return String(s)
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;");
+}
+
+function showAgentPrompt({ badge, title, bodyHtml, bodyNode, actions, cancel }) {
+  return new Promise((resolve) => {
+    const overlay = $("agent-prompt-overlay");
+    $("agent-prompt-badge").textContent = badge || "Grok";
+    $("agent-prompt-title").textContent = title || "Grok needs a decision";
+    const body = $("agent-prompt-body");
+    body.textContent = "";
+    if (bodyNode) body.appendChild(bodyNode);
+    else body.innerHTML = bodyHtml || "";
+    const box = $("agent-prompt-options");
+    box.textContent = "";
+    const finish = (value) => {
+      overlay.classList.add("hidden");
+      overlay.onclick = null;
+      agentPromptCancel = null;
+      resolve(value);
+    };
+    agentPromptCancel = () => finish(cancel);
+    for (const a of actions || []) {
+      const btn = document.createElement("button");
+      btn.type = "button";
+      btn.className = a.cls || "btn";
+      btn.textContent = a.label;
+      btn.addEventListener("click", () => finish(a.result));
+      box.appendChild(btn);
+    }
+    overlay.onclick = (e) => {
+      if (e.target === overlay) finish(cancel);
+    };
+    overlay.classList.remove("hidden");
+  });
+}
 
 function updatePermWaiting() {
   const el = $("perm-waiting");
@@ -1602,6 +1747,11 @@ $("perm-overlay").addEventListener("click", (e) => {
 
 document.addEventListener("keydown", (e) => {
   if (e.key !== "Escape") return;
+  if (!$("agent-prompt-overlay").classList.contains("hidden") && agentPromptCancel) {
+    e.preventDefault();
+    agentPromptCancel();
+    return;
+  }
   if (!$("perm-overlay").classList.contains("hidden") && permDeny) {
     e.preventDefault();
     permDeny();
@@ -1997,10 +2147,27 @@ function updateComposer() {
 async function sendPrompt() {
   const input = $("prompt-input");
   const text = input.value.trim();
-  const chat = state.activeChat;
-  if (!text || !chat || chat.busy) return;
+  if (!text) return;
 
   hideSlashMenu();
+
+  // 1.1.0 could leave the composer looking enabled (saved folder, no session
+  // yet — session/new failed or still in flight) and then silently return.
+  let chat = state.activeChat;
+  if (!chat) {
+    if (!state.folder) {
+      toast("Open a project folder to start a chat.");
+      return;
+    }
+    await newChat();
+    chat = state.activeChat;
+    if (!chat) {
+      toast("Couldn't start a chat — pick the project folder again.");
+      return;
+    }
+  }
+  if (chat.busy) return;
+
   input.value = "";
   autosize(input);
 
