@@ -665,7 +665,7 @@ async function resumeSession(stored) {
   beginTurn(chat, true);
   setTurnStatus(chat, "Restoring conversation…");
   try {
-    const result = await client.loadSession(stored.sessionId, stored.cwd);
+    const result = await client.resumeSession(stored.sessionId, stored.cwd);
     if (result?.models) {
       chat.models = result.models;
       updateModelLabel();

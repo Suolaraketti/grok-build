@@ -13,6 +13,7 @@ use compat::{
 };
 
 use std::collections::HashMap;
+use std::io::Write;
 use std::path::{Path, PathBuf};
 
 use serde::Serialize;
@@ -24,7 +25,7 @@ use xai_grok_tools::util::truncate::estimate_tokens;
 const TREE: &str = "\u{2514}";
 
 /// Coarse scope label for project instructions and plugin entries.
-#[derive(Debug, Clone, Copy, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Scope {
     Project,
@@ -53,7 +54,7 @@ impl std::fmt::Display for Scope {
 
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
-pub struct InspectReport {
+pub(crate) struct InspectReport {
     pub grok_version: String,
     pub channel: String,
     pub cwd: String,
@@ -73,15 +74,16 @@ pub struct InspectReport {
     pub lsp_servers: Vec<LspServerEntry>,
     pub config_sources: ConfigSources,
     pub external_compat: ExternalCompatReport,
-    /// Warnings from `[model.*]` parsing.
     #[serde(skip_serializing_if = "Vec::is_empty")]
-    pub model_override_warnings:
-        Vec<crate::agent::config_model_override_parse::ModelOverrideWarning>,
+    pub config_warnings: Vec<crate::agent::config_model_override_parse::ConfigWarning>,
+    /// Invalid or ignored `[mcp_servers.*]` entries.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub mcp_config_problems: Vec<crate::util::config::McpServerConfigProblem>,
 }
 
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
-pub struct InstructionFile {
+pub(crate) struct InstructionFile {
     pub path: String,
     pub scope: Scope,
     pub file_type: String,
@@ -99,7 +101,7 @@ pub struct InstructionFile {
 
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
-pub struct PermissionsReport {
+pub(crate) struct PermissionsReport {
     pub sources: Vec<String>,
     pub loaded: usize,
     pub skipped: Vec<SkippedRule>,
@@ -123,7 +125,7 @@ pub struct PermissionsReport {
 /// derives its line from these fields (see `enforced_label`).
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
-pub struct EnforcedPolicy {
+pub(crate) struct EnforcedPolicy {
     /// Stable key: "alwaysApprove" | "telemetry" | "feedback".
     pub setting: String,
     /// The enforced value.
@@ -134,7 +136,7 @@ pub struct EnforcedPolicy {
 
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
-pub struct SkippedRule {
+pub(crate) struct SkippedRule {
     pub rule: String,
     pub reason: String,
 }
@@ -144,7 +146,7 @@ pub struct SkippedRule {
 /// The team pin is admin policy, not a secret, so it is shown verbatim.
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
-pub struct LoginPolicyReport {
+pub(crate) struct LoginPolicyReport {
     /// Raw `disable_api_key_auth` knob (env `GROK_DISABLE_API_KEY_AUTH`).
     pub disable_api_key_auth: Option<bool>,
     /// Configured team pin: single string, list, or null when unset.
@@ -155,7 +157,7 @@ pub struct LoginPolicyReport {
 
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
-pub struct HookEntry {
+pub(crate) struct HookEntry {
     pub event: String,
     pub hook_type: String,
     pub target: String,
@@ -172,7 +174,7 @@ pub struct HookEntry {
 
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
-pub struct SkillEntry {
+pub(crate) struct SkillEntry {
     pub name: String,
     pub description: String,
     pub source: ConfigSource,
@@ -185,11 +187,18 @@ pub struct SkillEntry {
     pub disabled: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub compatibility_status: Option<CompatEntryStatus>,
+    /// Bare name this skill lost (`login`, `commit`, …).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub collides_with: Option<String>,
+    /// Qualified invocation when [`Self::collides_with`] is set. Absent when
+    /// that name is contested too.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub invocable_as: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
-pub struct AgentEntry {
+pub(crate) struct AgentEntry {
     pub name: String,
     pub description: String,
     pub source: ConfigSource,
@@ -216,7 +225,7 @@ pub struct PluginProvides {
 
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
-pub struct MarketplaceEntry {
+pub(crate) struct MarketplaceEntry {
     pub name: String,
     pub path: String,
     pub enabled_plugins: usize,
@@ -242,7 +251,7 @@ pub struct McpServerEntry {
 
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
-pub struct LspServerEntry {
+pub(crate) struct LspServerEntry {
     pub name: String,
     pub command: String,
     pub args: Vec<String>,
@@ -255,7 +264,7 @@ pub struct LspServerEntry {
 
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
-pub struct ConfigSources {
+pub(crate) struct ConfigSources {
     /// Config layers (system + user managed, user + system requirements, user
     /// config.toml, the macOS MDM managed-preferences layer, and project
     /// .grok/config.toml files). Driven from the same resolvers used at runtime
@@ -268,7 +277,7 @@ pub struct ConfigSources {
 /// A single config layer entry for `grok inspect`.
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
-pub struct ConfigLayer {
+pub(crate) struct ConfigLayer {
     /// Logical role of the layer: "system-managed", "managed", "user",
     /// "system-requirements", "requirements", "mdm", or "project".
     pub role: String,
@@ -282,14 +291,20 @@ pub struct ConfigLayer {
 
 pub async fn inspect(cwd: &Path, json: bool) -> anyhow::Result<()> {
     let report = build_report(cwd).await;
+    write_inspect(&report, json, &mut std::io::stdout().lock())
+}
 
-    if json {
-        println!("{}", serde_json::to_string_pretty(&report)?);
+/// Write the report. A closed stdout (`grok inspect | head`) is a clean stop.
+fn write_inspect(report: &InspectReport, json: bool, out: &mut impl Write) -> anyhow::Result<()> {
+    let written = if json {
+        writeln!(out, "{}", serde_json::to_string_pretty(report)?)
     } else {
-        print_human(&report);
+        print_human(report, out)
+    };
+    match written {
+        Err(e) if e.kind() == std::io::ErrorKind::BrokenPipe => Ok(()),
+        other => other.map_err(Into::into),
     }
-
-    Ok(())
 }
 
 async fn build_report(cwd: &Path) -> InspectReport {
@@ -303,8 +318,11 @@ async fn build_report(cwd: &Path) -> InspectReport {
     if let Some(table) = config_without_compat.as_table_mut() {
         table.remove("compat");
     }
-    let parsed_config =
-        crate::agent::config::Config::new_from_toml_cfg(&config_without_compat).ok();
+    let parsed_config = crate::agent::config::Config::new_from_toml_cfg(&config_without_compat);
+    // A config that does not parse is the answer `inspect` exists to give, so
+    // keep the reason rather than reporting an empty config as a clean one.
+    let config_parse_error = parsed_config.as_ref().err().cloned();
+    let parsed_config = parsed_config.ok();
 
     let git_root = git2::Repository::discover(cwd)
         .ok()
@@ -350,7 +368,7 @@ async fn build_report(cwd: &Path) -> InspectReport {
     // Discover with all vendors ON so inspect shows the full set on disk.
     let (mut instructions, permissions, mut skills) = tokio::join!(
         list_instructions(cwd),
-        list_permissions(cwd),
+        list_permissions(cwd, project_trusted),
         list_skills(cwd, &plugin_registry, &skills_config),
     );
 
@@ -380,10 +398,20 @@ async fn build_report(cwd: &Path) -> InspectReport {
     }
     let lsp = list_lsp_servers(cwd, &discovered_plugins);
     let configs = list_config_sources(cwd);
-    let model_override_warnings = parsed_config
+    let mut config_warnings = parsed_config
         .as_ref()
-        .map(|c| c.model_override_warnings.clone())
+        .map(|c| c.config_warnings.clone())
         .unwrap_or_default();
+    if let Some(error) = config_parse_error {
+        config_warnings.push(
+            crate::agent::config_model_override_parse::ConfigWarning::config_key(
+                "config".to_owned(),
+                crate::agent::config_model_override_parse::ConfigWarningKind::InvalidValue,
+                format!("the config does not load: {error}"),
+            ),
+        );
+    }
+    let mcp_config_problems = crate::util::config::load_mcp_server_problems_with_project(cwd);
 
     InspectReport {
         grok_version: xai_grok_version::VERSION.to_string(),
@@ -405,7 +433,8 @@ async fn build_report(cwd: &Path) -> InspectReport {
         lsp_servers: lsp,
         config_sources: configs,
         external_compat,
-        model_override_warnings,
+        config_warnings,
+        mcp_config_problems,
     }
 }
 
@@ -440,13 +469,35 @@ fn has_rules_directory(file_path: &str, config_dir: &str) -> bool {
     false
 }
 
+fn instruction_scope(
+    file_path: &str,
+    grok_home: &Path,
+    vendor_homes: &[(PathBuf, bool)],
+    workspace_root: &Path,
+) -> Scope {
+    if crate::util::is_user_instruction_path(
+        Path::new(file_path),
+        grok_home,
+        vendor_homes,
+        &[workspace_root],
+    ) {
+        Scope::Global
+    } else {
+        Scope::Project
+    }
+}
+
 fn instruction_file_type(
     file_path: &str,
+    grok_home: &Path,
     claude_imported: bool,
     extra_rule_prefixes: &[PathBuf],
 ) -> &'static str {
     let path = Path::new(file_path);
-    if has_rules_directory(file_path, ".grok")
+    if path
+        .parent()
+        .is_some_and(|parent| parent == grok_home.join("rules"))
+        || has_rules_directory(file_path, ".grok")
         || has_rules_directory(file_path, ".cursor")
         || (!claude_imported && has_rules_directory(file_path, ".claude"))
         || extra_rule_prefixes
@@ -468,7 +519,19 @@ async fn list_instructions(cwd: &Path) -> Vec<InstructionFile> {
     )
     .await;
 
-    let grok_home = Some(crate::util::grok_home::grok_home());
+    let grok_home = crate::util::grok_home::grok_home();
+    let vendor_homes = dirs::home_dir()
+        .map(|home_dir| {
+            vec![
+                (home_dir.join(".claude"), true),
+                (home_dir.join(".cursor"), true),
+            ]
+        })
+        .unwrap_or_default();
+    let workspace_root = git2::Repository::discover(cwd)
+        .ok()
+        .and_then(|repo| repo.workdir().map(Path::to_path_buf))
+        .unwrap_or_else(|| cwd.to_path_buf());
 
     // Phase 2 cutoff: when imported, stop classifying `.claude/rules/` paths
     // as rules. Equivalent dirs come in via `[paths] extra_rule_dirs`.
@@ -488,21 +551,15 @@ async fn list_instructions(cwd: &Path) -> Vec<InstructionFile> {
     // have this limitation; rules need the same treatment in a follow-up.
     let extra_rule_prefixes: Vec<std::path::PathBuf> = extra_rule_dirs
         .iter()
-        .map(|d| crate::claude_import::expand_home(d))
+        .map(|d| crate::util::expand_home(d))
         .collect();
 
     configs
         .into_iter()
         .map(|c| {
-            let file_type = instruction_file_type(&c.file_path, imported, &extra_rule_prefixes);
-            let scope = if grok_home
-                .as_deref()
-                .is_some_and(|home| Path::new(&c.file_path).starts_with(home))
-            {
-                Scope::Global
-            } else {
-                Scope::Project
-            };
+            let file_type =
+                instruction_file_type(&c.file_path, &grok_home, imported, &extra_rule_prefixes);
+            let scope = instruction_scope(&c.file_path, &grok_home, &vendor_homes, &workspace_root);
             let size = c.content.len();
             let vendor = derive_vendor(&c.file_path).map(String::from);
             InstructionFile {
@@ -521,7 +578,7 @@ async fn list_instructions(cwd: &Path) -> Vec<InstructionFile> {
 
 /// Calls the production permission resolver (`resolve_permissions_with_provenance`)
 /// which handles both Grok TOML and vendor settings fallback in one codepath.
-async fn list_permissions(cwd: &Path) -> PermissionsReport {
+async fn list_permissions(cwd: &Path, project_trusted: bool) -> PermissionsReport {
     use xai_grok_workspace::permission::resolution;
 
     let ms = resolution::managed_settings();
@@ -576,7 +633,9 @@ async fn list_permissions(cwd: &Path) -> PermissionsReport {
         }
     }
 
-    let Some(resolved) = resolution::resolve_permissions_with_provenance(cwd).await else {
+    let Some(resolved) =
+        resolution::resolve_permissions_with_provenance(cwd, project_trusted).await
+    else {
         return PermissionsReport {
             sources: vec![],
             loaded: 0,
@@ -636,37 +695,43 @@ fn list_hooks(
     discovered_plugins: &[xai_grok_agent::plugins::DiscoveredPlugin],
 ) -> Vec<HookEntry> {
     let all_on = xai_grok_tools::types::compat::CompatConfig::default();
-    let source_paths = crate::util::hooks::discover_hook_source_paths(git_root, &all_on);
-    let (global_sources, project_sources) = source_paths.as_sources(project_trusted);
-
+    // Route through the same assembly as session startup so config-layer hooks
+    // (config.toml / managed_config.toml / requirements.toml) appear in `/hooks`
+    // status alongside file hooks, each carrying its provenance name prefix.
+    let config_layers = xai_grok_config::hook_config_layers();
     let (registry, _errors) =
-        xai_grok_hooks::discovery::load_hooks_from_sources(&global_sources, &project_sources);
-
-    let home_dir = dirs::home_dir();
-    let grok_home = xai_grok_config::grok_home();
+        crate::util::hooks::assemble_hooks(&config_layers, git_root, &all_on, project_trusted);
 
     let mut entries: Vec<HookEntry> = registry
         .all_hooks()
         .into_iter()
         .map(|h| {
-            let is_user_scope = h.source_dir.starts_with(&grok_home)
-                || home_dir.as_deref().is_some_and(|home| {
-                    h.source_dir.starts_with(home.join(".cursor"))
-                        || h.source_dir.starts_with(home.join(".claude"))
-                });
-            let source = if is_user_scope {
-                ConfigSource::User {
-                    path: h.source_dir.clone(),
-                }
-            } else {
-                ConfigSource::Project {
-                    path: h.source_dir.clone(),
-                }
+            // Classify via the shared `hook_origin` (typed provenance + file-tier
+            // name prefix), the same classifier telemetry uses, so admin/system
+            // hooks aren't mislabeled and the two surfaces can't diverge.
+            use xai_grok_hooks::config::HookOrigin as O;
+            // Config-layer hooks store the layer's directory in `source_dir`;
+            // rejoin the tier's filename so inspect shows the actual config file.
+            let config_file = |name: &str| h.source_dir.join(name);
+            let path = h.source_dir.clone();
+            let source = match xai_grok_hooks::config::hook_origin(h) {
+                O::SystemManaged | O::Managed => ConfigSource::Managed {
+                    path: Some(config_file(xai_grok_config::MANAGED_CONFIG_FILENAME)),
+                },
+                O::Requirements => ConfigSource::Managed {
+                    path: Some(config_file(xai_grok_config::REQUIREMENTS_FILENAME)),
+                },
+                O::UserConfig => ConfigSource::ConfigToml {
+                    path: config_file(xai_grok_config::USER_CONFIG_FILENAME),
+                },
+                O::ProjectFile => ConfigSource::Project { path },
+                // File/plugin/agent/unknown hooks are user-scoped for display.
+                O::UserFile | O::Plugin | O::Agent | O::Unknown => ConfigSource::User { path },
             };
             let vendor = derive_vendor(&h.source_dir.display().to_string()).map(String::from);
             HookEntry {
-                event: format!("{:?}", h.event),
-                hook_type: h.handler_type.clone(),
+                event: h.event.to_string(),
+                hook_type: h.handler_type.as_str().to_string(),
                 target: h
                     .command
                     .as_ref()
@@ -733,12 +798,13 @@ async fn list_skills(
     )
     .await;
 
-    let grok_home = crate::util::grok_home::grok_home();
+    let name_counts = slash_name_counts(&skills);
     skills
         .into_iter()
         .map(|s| {
-            let source = skill_entry_source(&s, &grok_home);
+            let source = skill_entry_source(&s);
             let vendor = derive_vendor(&s.path).map(String::from);
+            let (collides_with, invocable_as) = slash_collision(&s, &name_counts);
             SkillEntry {
                 name: s.label().to_string(),
                 description: s.description,
@@ -748,30 +814,56 @@ async fn list_skills(
                 // Preserve `[skills].disabled`; compatibility is applied later.
                 disabled: !s.enabled,
                 compatibility_status: None,
+                collides_with,
+                invocable_as,
             }
         })
         .collect()
 }
 
+fn slash_name_counts(
+    skills: &[xai_grok_agent::prompt::skills::SkillInfo],
+) -> HashMap<String, usize> {
+    let mut counts: HashMap<String, usize> = HashMap::new();
+    for skill in skills.iter().filter(|s| s.user_invocable && s.enabled) {
+        *counts.entry(skill.name.to_lowercase()).or_default() += 1;
+        *counts
+            .entry(
+                xai_grok_tools::implementations::skills::skill::format_skill_name(skill)
+                    .to_lowercase(),
+            )
+            .or_default() += 1;
+    }
+    counts
+}
+
+fn slash_collision(
+    skill: &xai_grok_agent::prompt::skills::SkillInfo,
+    name_counts: &HashMap<String, usize>,
+) -> (Option<String>, Option<String>) {
+    if !skill.user_invocable || !skill.enabled {
+        return (None, None);
+    }
+    let name_key = skill.name.to_lowercase();
+    let contested = crate::session::slash_commands::is_reserved_slash_name(&skill.name)
+        || name_counts.get(&name_key).is_some_and(|n| *n > 1);
+    if !contested {
+        return (None, None);
+    }
+    let qualified =
+        xai_grok_tools::implementations::skills::skill::format_skill_name(skill).to_lowercase();
+    let invocable_as = name_counts
+        .get(&qualified)
+        .is_some_and(|n| *n == 1)
+        .then_some(qualified);
+    (Some(skill.name.clone()), invocable_as)
+}
+
 /// Resolve the inspect-facing source for a discovered skill.
 ///
 /// Prefers the discovery-stamped `config_source` (plugin skills,
-/// `[skills].paths` entries), then falls back to a scope mapping. One
-/// display-only fixup: bundled skills are extracted to
-/// `<grok_home>/skills/<name>/SKILL.md` and discovered as user skills, so a
-/// skill at exactly that path with a bundled name is re-labeled `Bundled`
-/// (`builtin::is_extracted_bundled_skill`) — a same-named skill anywhere else
-/// stays non-bundled. Runtime discovery scopes/precedence are untouched.
-///
-/// `Bundled`/`Server` sources are constructed only here, never by runtime
-/// discovery: deployed pagers parse `x.ai/skills/list` into a typed
-/// `ConfigSource` and reject unknown tags, so runtime stamping must wait
-/// until clients without these variants have aged out. Until then this
-/// mapping is the single owner of the scope→source translation.
-fn skill_entry_source(
-    s: &xai_grok_agent::prompt::skills::SkillInfo,
-    grok_home: &Path,
-) -> ConfigSource {
+/// `[skills].paths` entries), then falls back to the discovered scope.
+fn skill_entry_source(s: &xai_grok_agent::prompt::skills::SkillInfo) -> ConfigSource {
     use xai_grok_tools::implementations::skills::types::SkillScope;
 
     if let Some(source) = s.config_source.clone() {
@@ -780,13 +872,7 @@ fn skill_entry_source(
     let path = PathBuf::from(&s.path);
     match s.scope {
         SkillScope::Local | SkillScope::Repo => ConfigSource::Project { path },
-        SkillScope::User => {
-            if crate::builtin::is_extracted_bundled_skill(&s.name, &path, grok_home) {
-                ConfigSource::Bundled { path }
-            } else {
-                ConfigSource::User { path }
-            }
-        }
+        SkillScope::User => ConfigSource::User { path },
         SkillScope::Server => ConfigSource::Server { path },
         SkillScope::Bundled => ConfigSource::Bundled { path },
         SkillScope::Plugin => ConfigSource::Plugin {
@@ -1031,6 +1117,30 @@ fn list_config_sources(cwd: &Path) -> ConfigSources {
         }
     }
 
+    let inline_env = crate::config::GROK_CONFIG_ENV;
+    let path_env = crate::config::GROK_CONFIG_PATH_ENV;
+    if let Some(overlay) = crate::config::resolved_env_overlay() {
+        if !overlay.sections.is_empty() {
+            let path = match overlay.source {
+                crate::config::OverlaySource::Inline => format!("${inline_env} (inline)"),
+                crate::config::OverlaySource::Path(p) => p.display().to_string(),
+            };
+            layers.push(ConfigLayer {
+                role: "env_overlay".to_string(),
+                path,
+                note: Some(format!("sections: {}", overlay.sections.join(", "))),
+            });
+        }
+    } else if std::env::var_os(inline_env).is_some_and(|v| !v.to_string_lossy().trim().is_empty())
+        || std::env::var_os(path_env).is_some_and(|v| !v.is_empty())
+    {
+        layers.push(ConfigLayer {
+            role: "env_overlay".to_string(),
+            path: format!("${inline_env} / ${path_env}"),
+            note: Some("set but ignored (empty, malformed, or unreadable)".to_string()),
+        });
+    }
+
     // Requirements: user then system (order they appear in requirements_layers)
     if let Some(home) = crate::config::user_grok_home() {
         let p = home.join("requirements.toml");
@@ -1146,35 +1256,43 @@ fn requirements_layer_contributes(
     })
 }
 
-fn print_section<T>(title: &str, items: &[T], format_item: impl Fn(&T) -> String) {
-    println!();
-    println!("  {} ({})", title, items.len());
+fn print_section<T>(
+    out: &mut impl Write,
+    title: &str,
+    items: &[T],
+    format_item: impl Fn(&T) -> String,
+) -> std::io::Result<()> {
+    writeln!(out)?;
+    writeln!(out, "  {} ({})", title, items.len())?;
     if items.is_empty() {
-        println!("  {TREE} (none)");
+        writeln!(out, "  {TREE} (none)")?;
     }
     for item in items {
-        println!("  {TREE} {}", format_item(item));
+        writeln!(out, "  {TREE} {}", format_item(item))?;
     }
+    Ok(())
 }
 
 /// Print items in a two-column layout: name on the left, source label on the right.
 fn print_columns<T>(
+    out: &mut impl Write,
     title: &str,
     items: &[T],
     name: impl Fn(&T) -> String,
     label: impl Fn(&T) -> String,
-) {
-    println!();
-    println!("  {} ({})", title, items.len());
+) -> std::io::Result<()> {
+    writeln!(out)?;
+    writeln!(out, "  {} ({})", title, items.len())?;
     if items.is_empty() {
-        println!("  {TREE} (none)");
-        return;
+        writeln!(out, "  {TREE} (none)")?;
+        return Ok(());
     }
     let names: Vec<String> = items.iter().map(&name).collect();
-    let pad = names.iter().map(|n| n.len()).max().unwrap_or(0).min(50);
+    let pad = names.iter().map(String::len).max().unwrap_or(0).min(50);
     for (item, n) in items.iter().zip(&names) {
-        println!("  {TREE} {:<pad$}  {}", n, label(item));
+        writeln!(out, "  {TREE} {:<pad$}  {}", n, label(item))?;
     }
+    Ok(())
 }
 
 /// Render the team pin for the human view: single value, comma-joined list,
@@ -1214,35 +1332,43 @@ fn disabled_compat_tags(
     }
 }
 
-/// Renders the "Model Overrides" section of the human report; empty when
-/// there are no warnings.
-fn render_model_override_warnings(
-    warnings: &[crate::agent::config_model_override_parse::ModelOverrideWarning],
+fn render_config_warnings(
+    warnings: &[crate::agent::config_model_override_parse::ConfigWarning],
 ) -> String {
     use std::fmt::Write as _;
 
     if warnings.is_empty() {
         return String::new();
     }
-    let mut out = String::from("\n  Model Overrides\n");
-    let _ = writeln!(
-        out,
-        "  {TREE} {} warning(s) (models with invalid fields kept in catalog)",
-        warnings.len()
-    );
+    let mut out = String::from("\n  Config Warnings\n");
+    let _ = writeln!(out, "  {TREE} {} warning(s)", warnings.len());
     for w in warnings {
-        let target = match w.model_key.as_deref() {
-            Some(key) => format!("[model.\"{key}\"]"),
-            None => "[model]".to_owned(),
+        let field = w.field().map(|f| format!(" {f}")).unwrap_or_default();
+        let _ = writeln!(
+            out,
+            "    {TREE} [{}]{field} — {}",
+            w.target.label(),
+            w.reason
+        );
+    }
+    out
+}
+
+fn render_mcp_config_problems(problems: &[crate::util::config::McpServerConfigProblem]) -> String {
+    use crate::util::config::McpServerProblemSeverity;
+    use std::fmt::Write as _;
+
+    if problems.is_empty() {
+        return String::new();
+    }
+    let mut out = String::from("\n  MCP Config Problems\n");
+    let _ = writeln!(out, "  {TREE} {} problem(s)", problems.len());
+    for p in problems {
+        let severity = match p.severity {
+            McpServerProblemSeverity::Error => "error",
+            McpServerProblemSeverity::Warning => "warning",
         };
-        match w.field.as_deref() {
-            Some(field) => {
-                let _ = writeln!(out, "    {TREE} {target} {field} — {}", w.reason);
-            }
-            None => {
-                let _ = writeln!(out, "    {TREE} {target} — {}", w.reason);
-            }
-        }
+        let _ = writeln!(out, "    {TREE} [{severity}] {}", p.message);
     }
     out
 }
@@ -1268,20 +1394,21 @@ fn render_harness_compatibility(report: &ExternalCompatReport) -> String {
     out
 }
 
-fn print_human(r: &InspectReport) {
-    println!();
-    println!("  Environment");
-    println!("  {TREE} Version: {} [{}]", r.grok_version, r.channel);
-    println!("  {TREE} CWD: {}", r.cwd);
+fn print_human(r: &InspectReport, out: &mut impl Write) -> std::io::Result<()> {
+    writeln!(out)?;
+    writeln!(out, "  Environment")?;
+    writeln!(out, "  {TREE} Version: {} [{}]", r.grok_version, r.channel)?;
+    writeln!(out, "  {TREE} CWD: {}", r.cwd)?;
     if let Some(ref root) = r.project_root {
-        println!("  {TREE} Git root: {}", root);
+        writeln!(out, "  {TREE} Git root: {}", root)?;
     }
-    println!(
+    writeln!(
+        out,
         "  {TREE} Project trusted: {}",
         if r.project_trusted { "yes" } else { "no" }
-    );
+    )?;
 
-    print_section("Project Instructions", &r.project_instructions, |f| {
+    print_section(out, "Project Instructions", &r.project_instructions, |f| {
         let status = disabled_compat_tags(f.disabled, f.compatibility_status);
         format!(
             "{} ({}, ~{} tokens){}{}",
@@ -1291,10 +1418,10 @@ fn print_human(r: &InspectReport) {
             vendor_tag(&f.vendor),
             status,
         )
-    });
+    })?;
 
-    println!();
-    println!("  Permissions");
+    writeln!(out)?;
+    writeln!(out, "  Permissions")?;
     if r.permissions.managed_settings_exists
         && let Some(ref p) = r.permissions.managed_settings_path
     {
@@ -1303,89 +1430,108 @@ fn print_human(r: &InspectReport) {
         } else {
             "not loaded"
         };
-        println!("  {TREE} Managed settings: {p} ({status})");
+        writeln!(out, "  {TREE} Managed settings: {p} ({status})")?;
     }
     if r.permissions.sources.is_empty() {
-        println!("  {TREE} Source: (none)");
+        writeln!(out, "  {TREE} Source: (none)")?;
     } else {
         for src in &r.permissions.sources {
-            println!("  {TREE} Source: {src}");
+            writeln!(out, "  {TREE} Source: {src}")?;
         }
     }
-    println!(
+    writeln!(
+        out,
         "  {TREE} {} loaded, {} skipped",
         r.permissions.loaded,
         r.permissions.skipped.len()
-    );
+    )?;
     for s in &r.permissions.skipped {
-        println!("    {TREE} {} -- {}", s.rule, s.reason);
+        writeln!(out, "    {TREE} {} -- {}", s.rule, s.reason)?;
     }
     if !r.permissions.enforced.is_empty() {
-        println!("  {TREE} Enforced by policy");
+        writeln!(out, "  {TREE} Enforced by policy")?;
         for e in &r.permissions.enforced {
-            println!("    {TREE} {} ({})", enforced_label(e), e.source);
+            writeln!(out, "    {TREE} {} ({})", enforced_label(e), e.source)?;
         }
     }
     if !r.permissions.mcp_server_allowlist.is_empty() {
-        println!(
+        writeln!(
+            out,
             "  {TREE} MCP server allowlist ({} patterns)",
             r.permissions.mcp_server_allowlist.len()
-        );
+        )?;
         for pat in &r.permissions.mcp_server_allowlist {
-            println!("    {TREE} {}", pat);
+            writeln!(out, "    {TREE} {}", pat)?;
         }
     }
     if !r.permissions.marketplace_allowlist.is_empty() {
-        println!(
+        writeln!(
+            out,
             "  {TREE} Marketplace allowlist ({} sources)",
             r.permissions.marketplace_allowlist.len()
-        );
+        )?;
         for url in &r.permissions.marketplace_allowlist {
-            println!("    {TREE} {}", url);
+            writeln!(out, "    {TREE} {}", url)?;
         }
     }
 
-    println!();
-    println!("  Login Policy");
-    println!(
+    writeln!(out)?;
+    writeln!(out, "  Login Policy")?;
+    writeln!(
+        out,
         "  {TREE} disable_api_key_auth: {}",
         match r.login_policy.disable_api_key_auth {
             Some(v) => v.to_string(),
             None => "(unset)".to_string(),
         }
-    );
-    println!(
+    )?;
+    writeln!(
+        out,
         "  {TREE} force_login_team_uuid: {}",
         format_force_login_team(&r.login_policy.force_login_team_uuid)
-    );
-    println!(
+    )?;
+    writeln!(
+        out,
         "  {TREE} api_key_auth_disabled: {}",
         r.login_policy.api_key_auth_disabled
-    );
+    )?;
 
     print_columns(
+        out,
         "Skills",
         &r.skills,
         |s| s.name.clone(),
         |s| {
             let status = disabled_compat_tags(s.disabled, s.compatibility_status);
+            let collision = match (&s.collides_with, &s.invocable_as) {
+                (Some(contested), Some(invocable)) => {
+                    format!(" [collides with /{contested} → /{invocable}]")
+                }
+                (Some(contested), None) => {
+                    format!(" [collides with /{contested} — not invocable]")
+                }
+                _ => String::new(),
+            };
             format!(
-                "{}{}{}",
+                "{}{}{}{}",
                 s.source.display_label(),
                 vendor_tag(&s.vendor),
                 status,
+                collision,
             )
         },
-    );
+    )?;
 
     print_columns(
+        out,
         "Agents",
         &r.agents,
         |a| a.name.clone(),
         |a| a.source.display_label(),
-    );
+    )?;
 
     print_columns(
+        out,
         "Plugins",
         &r.plugins,
         |p| {
@@ -1412,21 +1558,22 @@ fn print_human(r: &InspectReport) {
                 parts.join(", ")
             }
         },
-    );
+    )?;
 
-    print_section("Marketplaces", &r.marketplaces, |m| {
+    print_section(out, "Marketplaces", &r.marketplaces, |m| {
         format!(
             "{} ({}, {} enabled plugins)",
             m.name, m.path, m.enabled_plugins
         )
-    });
+    })?;
 
     if r.mcp_servers.is_empty() {
-        println!();
-        println!("  MCP Servers (0)");
-        println!("  {TREE} (none) \u{2014} see `grok mcp add --help`");
+        writeln!(out)?;
+        writeln!(out, "  MCP Servers (0)")?;
+        writeln!(out, "  {TREE} (none) \u{2014} see `grok mcp add --help`")?;
     } else {
         print_columns(
+            out,
             "MCP Servers",
             &r.mcp_servers,
             |m| {
@@ -1445,10 +1592,11 @@ fn print_human(r: &InspectReport) {
                     status,
                 )
             },
-        );
+        )?;
     }
 
     print_columns(
+        out,
         "LSP Servers",
         &r.lsp_servers,
         |l| format!("{} ({} {})", l.name, l.command, l.args.join(" ")),
@@ -1456,9 +1604,10 @@ fn print_human(r: &InspectReport) {
             let untrusted = if l.untrusted { " [untrusted]" } else { "" };
             format!("{}{}", l.source.display_label(), untrusted)
         },
-    );
+    )?;
 
     print_columns(
+        out,
         "Hooks",
         &r.hooks,
         |h| {
@@ -1478,10 +1627,10 @@ fn print_human(r: &InspectReport) {
                 status,
             )
         },
-    );
+    )?;
 
-    println!();
-    println!("  Config Sources");
+    writeln!(out)?;
+    writeln!(out, "  Config Sources")?;
     // User is always emitted (with (none) when absent) for the primary user config.
     if let Some(user_l) = r.config_sources.layers.iter().find(|l| l.role == "user") {
         let tag = match user_l.note.as_deref() {
@@ -1489,9 +1638,9 @@ fn print_human(r: &InspectReport) {
             Some("parse error") => " (parse error)",
             _ => "",
         };
-        println!("  {TREE} User: {}{}", user_l.path, tag);
+        writeln!(out, "  {TREE} User: {}{}", user_l.path, tag)?;
     } else {
-        println!("  {TREE} User: (none)");
+        writeln!(out, "  {TREE} User: (none)")?;
     }
     for layer in &r.config_sources.layers {
         if layer.role == "user" {
@@ -1511,18 +1660,21 @@ fn print_human(r: &InspectReport) {
             "project" => "Project",
             other => other,
         };
-        println!("  {TREE} {}: {}{}", label, layer.path, tag);
+        writeln!(out, "  {TREE} {}: {}{}", label, layer.path, tag)?;
     }
     if !r.config_sources.layers.iter().any(|l| l.role == "project") {
-        println!("  {TREE} Project: (none)");
+        writeln!(out, "  {TREE} Project: (none)")?;
     }
 
-    print!(
+    write!(out, "{}", render_config_warnings(&r.config_warnings))?;
+    write!(
+        out,
         "{}",
-        render_model_override_warnings(&r.model_override_warnings)
-    );
+        render_mcp_config_problems(&r.mcp_config_problems)
+    )?;
 
-    print!("{}", render_harness_compatibility(&r.external_compat));
+    write!(out, "{}", render_harness_compatibility(&r.external_compat))?;
+    Ok(())
 }
 
 #[cfg(test)]
@@ -1604,7 +1756,7 @@ mod tests {
             ("claude", "/repo/.claude/rules/team.md"),
             ("claude", r"C:\repo\.claude\rules\team.md"),
         ] {
-            let file_type = instruction_file_type(path, false, &[]);
+            let file_type = instruction_file_type(path, Path::new("/home/user/.grok"), false, &[]);
             assert_eq!(file_type, "rules");
             assert_eq!(
                 instruction_compat_status(&Some(vendor.to_owned()), file_type, &report),
@@ -1613,19 +1765,25 @@ mod tests {
         }
 
         for path in ["/repo/.grok/rules/team.md", r"C:\repo\.grok\rules\team.md"] {
-            assert_eq!(instruction_file_type(path, false, &[]), "rules");
+            assert_eq!(
+                instruction_file_type(path, Path::new("/home/user/.grok"), false, &[]),
+                "rules"
+            );
         }
         for path in [
             "/repo/.cursor/rules/team.md",
             r"C:\repo\.cursor\rules\team.md",
         ] {
-            assert_eq!(instruction_file_type(path, true, &[]), "rules");
+            assert_eq!(
+                instruction_file_type(path, Path::new("/home/user/.grok"), true, &[]),
+                "rules"
+            );
         }
         for path in [
             "/repo/.claude/rules/team.md",
             r"C:\repo\.claude\rules\team.md",
         ] {
-            let file_type = instruction_file_type(path, true, &[]);
+            let file_type = instruction_file_type(path, Path::new("/home/user/.grok"), true, &[]);
             assert_eq!(file_type, "agents_md");
             assert_eq!(
                 instruction_compat_status(&Some("claude".to_owned()), file_type, &report),
@@ -1636,8 +1794,94 @@ mod tests {
             "/repo/not.cursor/rules/team.md",
             r"C:\repo\.cursor\ruleset\team.md",
         ] {
-            assert_eq!(instruction_file_type(path, false, &[]), "agents_md");
+            assert_eq!(
+                instruction_file_type(path, Path::new("/home/user/.grok"), false, &[]),
+                "agents_md"
+            );
         }
+    }
+
+    #[test]
+    fn grok_home_nested_in_workspace_keeps_direct_surfaces_global() {
+        let grok_home = Path::new("/repo/config");
+        let workspace = Path::new("/repo");
+        for path in ["/repo/config/AGENTS.md", "/repo/config/rules/global.md"] {
+            assert!(matches!(
+                instruction_scope(path, grok_home, &[], workspace),
+                Scope::Global
+            ));
+        }
+        for path in [
+            "/repo/config/.grok/rules/project.md",
+            "/repo/config/src/AGENTS.md",
+        ] {
+            assert!(matches!(
+                instruction_scope(path, grok_home, &[], workspace),
+                Scope::Project
+            ));
+        }
+    }
+
+    #[test]
+    fn vendor_home_nested_in_workspace_keeps_direct_surfaces_global() {
+        let vendor_homes = vec![(Path::new("/repo/.claude").to_path_buf(), true)];
+        let workspace = Path::new("/repo");
+        for path in ["/repo/.claude/rules/global.md", "/repo/.claude/CLAUDE.md"] {
+            assert!(matches!(
+                instruction_scope(path, Path::new("/other/grok"), &vendor_homes, workspace),
+                Scope::Global
+            ));
+        }
+        for path in [
+            "/repo/.claude/.claude/rules/project.md",
+            "/repo/.claude/src/AGENTS.md",
+        ] {
+            assert!(matches!(
+                instruction_scope(path, Path::new("/other/grok"), &vendor_homes, workspace),
+                Scope::Project
+            ));
+        }
+    }
+
+    #[test]
+    fn workspace_scope_wins_inside_grok_home() {
+        let grok_home = Path::new("/custom/grok");
+        let workspace = Path::new("/custom/grok/worktrees/repo");
+        for path in [
+            "/custom/grok/worktrees/repo/.cursor/rules/project.md",
+            "/custom/grok/worktrees/repo/src/AGENTS.md",
+        ] {
+            assert!(matches!(
+                instruction_scope(path, grok_home, &[], workspace),
+                Scope::Project
+            ));
+        }
+        assert!(matches!(
+            instruction_scope("/custom/grok/rules/global.md", grok_home, &[], workspace,),
+            Scope::Global
+        ));
+    }
+
+    #[test]
+    fn custom_grok_home_rules_are_classified_as_rules() {
+        assert_eq!(
+            instruction_file_type(
+                "/custom/config/rules/team.md",
+                Path::new("/custom/config"),
+                false,
+                &[],
+            ),
+            "rules"
+        );
+        assert_eq!(
+            instruction_file_type(
+                "/custom/config/AGENTS.md",
+                Path::new("/custom/config"),
+                false,
+                &[],
+            ),
+            "agents_md"
+        );
     }
 
     #[test]
@@ -1725,7 +1969,7 @@ mod tests {
     /// Model-override warnings flow from an effective config through `Config`
     /// to the human renderer and the JSON report.
     #[test]
-    fn model_override_warnings_inspect_smoke() {
+    fn config_warnings_inspect_smoke() {
         let effective: toml::Value = toml::from_str(
             r#"
             [model."grok-4.5"]
@@ -1738,23 +1982,23 @@ mod tests {
         )
         .unwrap();
         let cfg = crate::agent::config::Config::new_from_toml_cfg(&effective).unwrap();
-        let warnings = cfg.model_override_warnings;
+        let warnings = cfg.config_warnings;
         assert!(
             warnings
                 .iter()
-                .any(|w| w.field.as_deref() == Some("send_compactions_remaining")),
+                .any(|w| w.field() == Some("send_compactions_remaining")),
             "duplicate alias should warn: {warnings:?}"
         );
         assert!(
             warnings
                 .iter()
-                .any(|w| w.field.as_deref() == Some("reasoning_effort")),
+                .any(|w| w.field() == Some("reasoning_effort")),
             "invalid enum should warn: {warnings:?}"
         );
         assert!(cfg.config_models.contains_key("grok-4.5"));
 
-        let human = render_model_override_warnings(&warnings);
-        assert!(human.contains("Model Overrides"), "{human}");
+        let human = render_config_warnings(&warnings);
+        assert!(human.contains("Config Warnings"), "{human}");
         assert!(
             human.contains("[model.\"grok-4.5\"] send_compactions_remaining"),
             "{human}"
@@ -1763,7 +2007,33 @@ mod tests {
             human.contains("[model.\"grok-4.5\"] reasoning_effort"),
             "{human}"
         );
-        assert_eq!(render_model_override_warnings(&[]), "");
+        // Auth-provider warnings render under their own table syntax.
+        let provider_warning =
+            crate::agent::config_model_override_parse::ConfigWarning::auth_provider(
+                "litellm",
+                Some("command"),
+                crate::agent::config_model_override_parse::ConfigWarningKind::InvalidValue,
+                "missing or empty command".to_owned(),
+            );
+        let human = render_config_warnings(&[provider_warning]);
+        assert!(
+            human.contains("[auth_provider.\"litellm\"] command"),
+            "{human}"
+        );
+        // A dotted provider name renders whole; the field splits off the
+        // right.
+        let dotted = crate::agent::config_model_override_parse::ConfigWarning::auth_provider(
+            "corp.gateway",
+            Some("token_ttl_secs"),
+            crate::agent::config_model_override_parse::ConfigWarningKind::InvalidValue,
+            "at or below the refresh margin".to_owned(),
+        );
+        let human = render_config_warnings(&[dotted]);
+        assert!(
+            human.contains("[auth_provider.\"corp.gateway\"] token_ttl_secs"),
+            "{human}"
+        );
+        assert_eq!(render_config_warnings(&[]), "");
 
         let json = serde_json::to_value(&warnings).unwrap();
         let alias_warning = json
@@ -1772,7 +2042,8 @@ mod tests {
             .iter()
             .find(|w| w["field"] == "send_compactions_remaining")
             .expect("alias warning present in JSON");
-        assert_eq!(alias_warning["modelKey"], "grok-4.5");
+        assert_eq!(alias_warning["target"], "model");
+        assert_eq!(alias_warning["key"], "grok-4.5");
         assert_eq!(alias_warning["kind"], "duplicate-alias");
         assert!(
             alias_warning["reason"]
@@ -1795,25 +2066,20 @@ mod tests {
 
     #[test]
     fn skill_entry_source_maps_scopes() {
-        let home = Path::new("/home/u/.grok");
-
         let s = skill_fixture("a", "/repo/.grok/skills/a/SKILL.md", SkillScope::Local);
         assert!(matches!(
-            skill_entry_source(&s, home),
+            skill_entry_source(&s),
             ConfigSource::Project { .. }
         ));
 
         let s = skill_fixture("b", "/repo/.grok/skills/b/SKILL.md", SkillScope::Repo);
         assert!(matches!(
-            skill_entry_source(&s, home),
+            skill_entry_source(&s),
             ConfigSource::Project { .. }
         ));
 
         let s = skill_fixture("c", "/home/u/.grok/skills/c/SKILL.md", SkillScope::User);
-        assert!(matches!(
-            skill_entry_source(&s, home),
-            ConfigSource::User { .. }
-        ));
+        assert!(matches!(skill_entry_source(&s), ConfigSource::User { .. }));
 
         let s = skill_fixture(
             "d",
@@ -1821,87 +2087,103 @@ mod tests {
             SkillScope::Server,
         );
         assert!(matches!(
-            skill_entry_source(&s, home),
+            skill_entry_source(&s),
             ConfigSource::Server { .. }
         ));
 
         let s = skill_fixture("e", "/home/u/.grok/bundled/e/SKILL.md", SkillScope::Bundled);
         assert!(matches!(
-            skill_entry_source(&s, home),
+            skill_entry_source(&s),
             ConfigSource::Bundled { .. }
         ));
     }
 
-    /// Bundled skills are re-labeled `Bundled` only at their exact extraction
-    /// path `<grok_home>/skills/<name>/SKILL.md`; a same-named skill anywhere
-    /// else keeps its real source.
+    fn blank_skill_entry(skill: &SkillInfo) -> SkillEntry {
+        SkillEntry {
+            name: skill.label().to_string(),
+            description: skill.description.clone(),
+            source: ConfigSource::User {
+                path: PathBuf::from(&skill.path),
+            },
+            user_invocable: skill.user_invocable,
+            vendor: None,
+            disabled: !skill.enabled,
+            compatibility_status: None,
+            collides_with: None,
+            invocable_as: None,
+        }
+    }
+
+    fn collision_entry(skill: &SkillInfo, all: &[SkillInfo]) -> SkillEntry {
+        let mut entry = blank_skill_entry(skill);
+        let (collides_with, invocable_as) = slash_collision(skill, &slash_name_counts(all));
+        entry.collides_with = collides_with;
+        entry.invocable_as = invocable_as;
+        entry
+    }
+
     #[test]
-    fn skill_entry_source_relabels_extracted_bundled_skills() {
-        let home = Path::new("/home/u/.grok");
-
-        let s = skill_fixture(
-            "help",
-            "/home/u/.grok/skills/help/SKILL.md",
-            SkillScope::User,
+    fn apply_slash_collision_flags_reserved_names_and_duplicates() {
+        let mut login = skill_fixture(
+            "login",
+            "/plugins/acme/skills/login/SKILL.md",
+            SkillScope::Plugin,
         );
-        assert!(matches!(
-            skill_entry_source(&s, home),
-            ConfigSource::Bundled { .. }
-        ));
+        login.plugin_name = Some("acme".into());
+        let deploy = skill_fixture("deploy", "/tmp/deploy/SKILL.md", SkillScope::Local);
+        // Gated builtins like /flush stay untagged — inspect must not invent
+        // /local:flush while the live catalog may still advertise /flush.
+        let flush = skill_fixture("flush", "/tmp/flush/SKILL.md", SkillScope::Local);
+        let commit_local = skill_fixture("commit", "/tmp/l/commit/SKILL.md", SkillScope::Local);
+        let commit_user = skill_fixture("commit", "/tmp/u/commit/SKILL.md", SkillScope::User);
+        let all = [login, deploy, flush, commit_local, commit_user];
+        let [login, deploy, flush, commit_local, commit_user] = &all;
 
-        // Bundled name in a project dir: stays project.
-        let s = skill_fixture("help", "/repo/.grok/skills/help/SKILL.md", SkillScope::Repo);
-        assert!(matches!(
-            skill_entry_source(&s, home),
-            ConfigSource::Project { .. }
-        ));
+        let entry = collision_entry(login, &all);
+        assert_eq!(entry.collides_with.as_deref(), Some("login"));
+        assert_eq!(entry.invocable_as.as_deref(), Some("acme:login"));
 
-        // Bundled name in a user dir outside <grok_home>/skills: stays user.
-        let s = skill_fixture(
-            "help",
-            "/home/u/other-skills/help/SKILL.md",
-            SkillScope::User,
-        );
-        assert!(matches!(
-            skill_entry_source(&s, home),
-            ConfigSource::User { .. }
-        ));
+        for skill in [deploy, flush] {
+            let entry = collision_entry(skill, &all);
+            assert_eq!(entry.collides_with, None, "{}", skill.name);
+            assert_eq!(entry.invocable_as, None, "{}", skill.name);
+        }
 
-        // Bundled frontmatter name in a different dir under <grok_home>/skills:
-        // not the extracted copy — stays user.
-        let s = skill_fixture(
-            "help",
-            "/home/u/.grok/skills/my-tools/SKILL.md",
-            SkillScope::User,
-        );
-        assert!(matches!(
-            skill_entry_source(&s, home),
-            ConfigSource::User { .. }
-        ));
+        let entry = collision_entry(commit_local, &all);
+        assert_eq!(entry.collides_with.as_deref(), Some("commit"));
+        assert_eq!(entry.invocable_as.as_deref(), Some("local:commit"));
+        let entry = collision_entry(commit_user, &all);
+        assert_eq!(entry.invocable_as.as_deref(), Some("user:commit"));
+    }
 
-        // Non-bundled name under <grok_home>/skills: stays user.
-        let s = skill_fixture(
-            "my-skill",
-            "/home/u/.grok/skills/my-skill/SKILL.md",
-            SkillScope::User,
-        );
-        assert!(matches!(
-            skill_entry_source(&s, home),
-            ConfigSource::User { .. }
-        ));
+    #[test]
+    fn apply_slash_collision_folds_reserved_name_case() {
+        let skill = skill_fixture("Login", "/tmp/Login/SKILL.md", SkillScope::Local);
+        let entry = collision_entry(&skill, std::slice::from_ref(&skill));
+        assert_eq!(entry.collides_with.as_deref(), Some("Login"));
+        assert_eq!(entry.invocable_as.as_deref(), Some("local:login"));
+    }
+
+    #[test]
+    fn apply_slash_collision_withholds_contested_qualified_names() {
+        let a = skill_fixture("commit", "/tmp/a/commit/SKILL.md", SkillScope::Local);
+        let b = skill_fixture("commit", "/tmp/b/commit/SKILL.md", SkillScope::Local);
+        let all = [a, b];
+        let entry = collision_entry(&all[0], &all);
+        assert_eq!(entry.collides_with.as_deref(), Some("commit"));
+        assert_eq!(entry.invocable_as, None);
     }
 
     /// A discovery-stamped `config_source` (plugins, `[skills].paths`) wins
     /// over the scope fallback.
     #[test]
     fn skill_entry_source_prefers_stamped_config_source() {
-        let home = Path::new("/home/u/.grok");
         let mut s = skill_fixture("cfg", "/team/skills/cfg/SKILL.md", SkillScope::User);
         s.config_source = Some(ConfigSource::ConfigToml {
             path: PathBuf::from("/team/skills/cfg/SKILL.md"),
         });
         assert!(matches!(
-            skill_entry_source(&s, home),
+            skill_entry_source(&s),
             ConfigSource::ConfigToml { .. }
         ));
     }
@@ -1961,5 +2243,89 @@ mod tests {
             !entries.iter().any(|e| e.name == "inspect-cfg-ignored"),
             "[skills].ignore must hide the skill"
         );
+    }
+
+    struct FailAfter {
+        remaining: usize,
+        kind: std::io::ErrorKind,
+    }
+
+    impl Write for FailAfter {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            if self.remaining == 0 {
+                return Err(std::io::Error::new(self.kind, "closed"));
+            }
+            let n = buf.len().min(self.remaining);
+            self.remaining -= n;
+            Ok(n)
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    fn empty_report() -> InspectReport {
+        InspectReport {
+            grok_version: "test".into(),
+            channel: "test".into(),
+            cwd: "/tmp".into(),
+            project_root: None,
+            project_trusted: true,
+            project_instructions: vec![],
+            permissions: PermissionsReport {
+                sources: vec![],
+                loaded: 0,
+                skipped: vec![],
+                mcp_server_allowlist: vec![],
+                marketplace_allowlist: vec![],
+                managed_settings_path: None,
+                managed_settings_exists: false,
+                managed_settings_active: false,
+                enforced: vec![],
+            },
+            login_policy: LoginPolicyReport {
+                disable_api_key_auth: None,
+                force_login_team_uuid: None,
+                api_key_auth_disabled: false,
+            },
+            hooks: vec![],
+            skills: vec![],
+            agents: vec![],
+            plugins: vec![],
+            marketplaces: vec![],
+            mcp_servers: vec![],
+            lsp_servers: vec![],
+            config_sources: ConfigSources { layers: vec![] },
+            external_compat: ExternalCompatReport {
+                remote_settings_loaded: false,
+                cells: vec![],
+            },
+            config_warnings: vec![],
+            mcp_config_problems: vec![],
+        }
+    }
+
+    #[test]
+    fn write_inspect_treats_broken_pipe_as_success() {
+        let report = empty_report();
+        for json in [false, true] {
+            let mut out = FailAfter {
+                remaining: 8,
+                kind: std::io::ErrorKind::BrokenPipe,
+            };
+            write_inspect(&report, json, &mut out).expect("broken pipe is a clean stop");
+        }
+    }
+
+    #[test]
+    fn write_inspect_surfaces_other_io_errors() {
+        let report = empty_report();
+        let mut out = FailAfter {
+            remaining: 0,
+            kind: std::io::ErrorKind::PermissionDenied,
+        };
+        write_inspect(&report, false, &mut out)
+            .expect_err("non-broken-pipe IO errors must surface");
     }
 }

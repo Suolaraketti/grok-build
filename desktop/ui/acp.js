@@ -114,6 +114,19 @@ export class AgentClient {
     return await this.request("session/load", { sessionId, cwd, mcpServers: [] });
   }
 
+  // Official Aug 4: first-class resume. Fall back to session/load on older agents.
+  async resumeSession(sessionId, cwd) {
+    try {
+      return await this.request("session/resume", { sessionId, cwd, mcpServers: [] });
+    } catch (err) {
+      const msg = String((err && err.message) || err);
+      if (/method not found|unknown|not supported|invalid/i.test(msg)) {
+        return await this.loadSession(sessionId, cwd);
+      }
+      throw err;
+    }
+  }
+
   async prompt(sessionId, text, meta = {}) {
     const params = {
       sessionId,

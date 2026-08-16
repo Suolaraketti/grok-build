@@ -8,6 +8,11 @@ use crate::types::output::{SearchToolOutput, ToolOutput};
 use crate::types::tool::{ToolKind, ToolNamespace};
 use crate::types::tool_index::ToolIndex;
 
+/// Wire name of the MCP discovery tool (see [`USE_TOOL_NAME`]).
+///
+/// [`USE_TOOL_NAME`]: crate::implementations::use_tool::USE_TOOL_NAME
+pub const SEARCH_TOOL_NAME: &str = "search_tool";
+
 /// Maximum length for MCP tool/server descriptions. Matches the common
 /// `MAX_MCP_DESCRIPTION_LENGTH` constant. Descriptions exceeding this are truncated.
 pub const MAX_MCP_DESCRIPTION_LENGTH: usize = 2048;
@@ -227,7 +232,7 @@ impl xai_tool_runtime::Tool for SearchTool {
     type Output = ToolOutput;
 
     fn id(&self) -> xai_tool_protocol::ToolId {
-        xai_tool_protocol::ToolId::new("search_tool").expect("valid tool id")
+        xai_tool_protocol::ToolId::new(SEARCH_TOOL_NAME).expect("valid tool id")
     }
 
     fn description(
@@ -235,14 +240,14 @@ impl xai_tool_runtime::Tool for SearchTool {
         _ctx: &::xai_tool_runtime::ListToolsContext,
     ) -> xai_tool_types::ToolDescription {
         xai_tool_types::ToolDescription::new(
-            "search_tool",
-            crate::types::tool_metadata::ToolMetadata::description_template(self),
+            SEARCH_TOOL_NAME,
+            crate::types::tool_metadata::ToolMetadata::sanitized_description_template(self),
         )
     }
 
     fn capabilities(&self) -> xai_tool_protocol::ToolCapabilities {
         xai_tool_protocol::ToolCapabilities {
-            is_read_only: true,
+            is_read_only: false,
             tool_scope: Some(xai_tool_protocol::ToolScope::Read),
             ..Default::default()
         }
@@ -322,10 +327,17 @@ impl xai_tool_runtime::Tool for SearchTool {
         } else {
             "partial"
         };
-        let note = if snapshot.is_ready {
-            None
-        } else {
+        let note = if !snapshot.is_ready {
             Some("Some MCP servers are still connecting. Results may be incomplete.")
+        } else if snapshot.total_hidden_tools == 0 && result_groups.is_empty() {
+            // Ready but empty: help distinguish "MCP not set up / inheritance
+            // off" from a query that simply matched nothing. Wording is
+            // source-agnostic: search_tool runs in parent and subagent sessions.
+            Some(
+                "No MCP tools are available in this session. Connect MCP servers here, or if this is a subagent, check the agent's mcpInheritance.",
+            )
+        } else {
+            None
         };
 
         let response = serde_json::json!({
@@ -417,6 +429,53 @@ mod tests {
         assert_eq!(
             json["results"][0]["tools"][0]["input_schema"]["properties"]["query"]["type"],
             "string"
+        );
+    }
+
+    #[tokio::test]
+    async fn search_tool_ready_empty_catalog_includes_guidance_note() {
+        let resources = crate::types::resources::Resources::default().into_shared();
+        resources
+            .lock()
+            .await
+            .insert(ToolIndex(std::sync::Arc::new(StaticToolIndex {
+                snapshot: SearchSnapshot {
+                    results: vec![],
+                    total_hidden_tools: 0,
+                    is_ready: true,
+                },
+            })));
+        let mut ctx =
+            xai_tool_runtime::ToolCallContext::new(xai_tool_protocol::ToolCallId::new_v7());
+        ctx.extensions.insert(resources);
+
+        let output = SearchTool
+            .run(
+                ctx,
+                SearchToolInput {
+                    query: "confluence".into(),
+                    limit: Some(5),
+                },
+            )
+            .await
+            .unwrap();
+        let ToolOutput::SearchTool(output) = output else {
+            panic!("expected search tool output");
+        };
+        let json: serde_json::Value = serde_json::from_str(&output.content).unwrap();
+        assert_eq!(json["status"], "ready");
+        assert_eq!(json["total_hidden_tools"], 0);
+        assert!(json["results"].as_array().unwrap().is_empty());
+        let note = json["note"]
+            .as_str()
+            .expect("empty ready catalog should set note");
+        assert!(
+            note.contains("Connect MCP servers") && note.contains("mcpInheritance"),
+            "expected source-agnostic guidance about connecting servers / mcpInheritance, got: {note}"
+        );
+        assert!(
+            !note.contains("parent session"),
+            "must not assume a parent session (tool is shared with top-level sessions), got: {note}"
         );
     }
 

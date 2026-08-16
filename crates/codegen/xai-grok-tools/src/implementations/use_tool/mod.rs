@@ -7,6 +7,11 @@ use crate::types::output::{MCPOutput, ToolOutput};
 use crate::types::tool::{ToolKind, ToolNamespace};
 use crate::util::mcp_truncate::{McpTruncateContext, truncate_tool_output};
 
+/// Wire name of the MCP dispatch tool. UIs special-case it: while its
+/// arguments stream, the target tool's name is still inside them, so the
+/// raw name is all a renderer has.
+pub const USE_TOOL_NAME: &str = "use_tool";
+
 /// Input for the `use_tool` meta-dispatch tool.
 #[derive(Debug, Clone, Deserialize, Serialize, JsonSchema)]
 pub struct UseToolInput {
@@ -281,7 +286,8 @@ impl crate::types::tool_metadata::ToolMetadata for UseTool {
     fn description_template(&self) -> &str {
         "Call an MCP integration tool.\n\n\
          The `tool_name` must be the qualified `server__tool` name (e.g., `linear__save_issue`). \
-         The `tool_input` must conform exactly to the input schema returned by `${{ tools.by_kind.search_tool }}`."
+         The `tool_input` must conform exactly to the tool's input schema\
+         ${%- if tools.by_kind.search_tool %} as returned by `${{ tools.by_kind.search_tool }}`${%- endif %}."
     }
 }
 
@@ -290,7 +296,7 @@ impl xai_tool_runtime::Tool for UseTool {
     type Output = ToolOutput;
 
     fn id(&self) -> xai_tool_protocol::ToolId {
-        xai_tool_protocol::ToolId::new("use_tool").expect("valid tool id")
+        xai_tool_protocol::ToolId::new(USE_TOOL_NAME).expect("valid tool id")
     }
 
     fn description(
@@ -298,8 +304,8 @@ impl xai_tool_runtime::Tool for UseTool {
         _ctx: &::xai_tool_runtime::ListToolsContext,
     ) -> xai_tool_types::ToolDescription {
         xai_tool_types::ToolDescription::new(
-            "use_tool",
-            crate::types::tool_metadata::ToolMetadata::description_template(self),
+            USE_TOOL_NAME,
+            crate::types::tool_metadata::ToolMetadata::sanitized_description_template(self),
         )
     }
 
@@ -1061,7 +1067,7 @@ mod tests {
                     "truncated output must contain truncation annotation, got: {}",
                     &text[text.len().saturating_sub(200)..],
                 );
-                let expected = format!("showing first {}", format_bytes(limit));
+                let expected = format!("showing first {}", format_bytes(limit as u64));
                 assert!(
                     text.contains(&expected),
                     "annotation must show the truncation limit ({expected})"
@@ -1120,7 +1126,7 @@ mod tests {
                     "truncated output must contain truncation annotation"
                 );
                 assert!(
-                    text.contains("showing first 5.0KB"),
+                    text.contains("showing first 4.9 KB"),
                     "annotation must reflect the custom limit"
                 );
             } else {

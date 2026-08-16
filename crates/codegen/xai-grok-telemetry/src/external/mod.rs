@@ -27,13 +27,14 @@
 
 pub mod config;
 mod emit;
-mod providers;
+pub(crate) mod providers;
 mod redact;
 pub mod schema;
 pub mod truncate;
 
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock};
+use std::time::Duration;
 
 use opentelemetry::logs::LoggerProvider as _;
 use opentelemetry::metrics::MeterProvider as _;
@@ -72,7 +73,7 @@ impl IdentityAttrs {
 /// reach init).
 #[derive(Debug, Clone, Copy, Default)]
 pub struct ExternalOtelRemotePolicy {
-    /// Fleet kill switch: flush, then drop subsequent emissions in-process.
+    /// Remote-policy force-disable: flush, then drop subsequent emissions in-process.
     pub force_disable: bool,
     /// Force the content gates off regardless of local env/config.
     pub lock_content_gates: bool,
@@ -98,9 +99,20 @@ pub struct ExternalTelemetry {
     include_version_on_metrics: bool,
     app_version: String,
     health: Arc<redact::ExportHealth>,
+    /// True when any signal was configured with a client cert/key pair.
+    mtls_identity_configured: bool,
     /// Init summary for the adoption meta-event (emitted once, post-auth).
     configured_meta: ConfiguredMeta,
     meta_event_once: std::sync::Once,
+}
+
+/// Snapshot of external-stream export-health counters.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct ExportHealthSnapshot {
+    pub records_dropped: u64,
+    pub metric_exports_dropped: u64,
+    pub export_failures: u64,
+    pub export_successes: u64,
 }
 
 #[derive(Debug, Clone)]
@@ -109,7 +121,7 @@ struct ConfiguredMeta {
     logs_exporter: &'static str,
     logs_endpoint_origin: String,
     metrics_endpoint_origin: String,
-    protocol: &'static str,
+    protocol: String,
     prompts_gate: bool,
     details_gate: bool,
     source: &'static str,
@@ -157,7 +169,10 @@ fn build_handle(cfg: ExternalOtelConfig) -> Option<Arc<ExternalTelemetry>> {
     let built = match providers::build(&cfg, gates.clone(), health.clone()) {
         Ok(built) => built,
         Err(e) => {
-            tracing::warn!(error = %e, "external otel: exporter construction failed; stream disabled");
+            tracing::warn!(
+                error = %e,
+                "external otel: exporter construction failed; stream disabled"
+            );
             return None;
         }
     };
@@ -180,11 +195,24 @@ fn build_handle(cfg: ExternalOtelConfig) -> Option<Arc<ExternalTelemetry>> {
         logs_endpoint_origin: crate::redact_common::url_origin(&cfg.logs_endpoint).into_owned(),
         metrics_endpoint_origin: crate::redact_common::url_origin(&cfg.metrics_endpoint)
             .into_owned(),
-        protocol: cfg.transport.as_protocol_str(),
+        protocol: if cfg.logs_transport == cfg.metrics_transport {
+            cfg.logs_transport.as_protocol_str().to_string()
+        } else {
+            format!(
+                "logs={},metrics={}",
+                cfg.logs_transport.as_protocol_str(),
+                cfg.metrics_transport.as_protocol_str()
+            )
+        },
         prompts_gate: cfg.gates.log_user_prompts,
         details_gate: cfg.gates.log_tool_details,
         source: cfg.enabled_source,
     };
+
+    let mtls_identity_configured = cfg.logs_client_certificate.is_some()
+        || cfg.logs_client_key.is_some()
+        || cfg.metrics_client_certificate.is_some()
+        || cfg.metrics_client_key.is_some();
 
     tracing::debug!(
         metrics_exporter = configured_meta.metrics_exporter,
@@ -206,6 +234,7 @@ fn build_handle(cfg: ExternalOtelConfig) -> Option<Arc<ExternalTelemetry>> {
         include_version_on_metrics: cfg.include_version_on_metrics,
         app_version: cfg.client.client_version.clone(),
         health,
+        mtls_identity_configured,
         configured_meta,
         meta_event_once: std::sync::Once::new(),
     }))
@@ -219,17 +248,106 @@ fn active_handle() -> Option<Arc<ExternalTelemetry>> {
     handle().filter(|ext| ext.active.load(Ordering::Relaxed))
 }
 
+/// Fail-closed OTEL gate. Defaults open; the leader closes it before init and
+/// re-opens it when settings resolve.
+///
+/// Opening is the synchronizing event: `OtelGate::apply_and_open` applies the
+/// remote force-disable (`active = false`) and then opens here, so an emitter
+/// whose `Acquire` read observes the `Release` open also observes
+/// `active = false`; the emit-path `active` load can therefore stay `Relaxed`.
+/// The window-expiry open has no such pairing and relies on eventual
+/// visibility, acceptable because the policy is tighten-only.
+static SETTINGS_RESOLVED: AtomicBool = AtomicBool::new(true);
+
+const DEFAULT_SETTINGS_GATE_MAX_WAIT: Duration = Duration::from_secs(30);
+
+static SETTINGS_GATE_MAX_WAIT_MS: AtomicU64 =
+    AtomicU64::new(DEFAULT_SETTINGS_GATE_MAX_WAIT.as_millis() as u64);
+
+static GATE_CLOSED_AT_MS: AtomicU64 = AtomicU64::new(0);
+
+fn process_uptime_ms() -> u64 {
+    static START: OnceLock<std::time::Instant> = OnceLock::new();
+    u64::try_from(
+        START
+            .get_or_init(std::time::Instant::now)
+            .elapsed()
+            .as_millis(),
+    )
+    .unwrap_or(u64::MAX)
+}
+
+/// Set the bound on the fail-closed window.
+pub fn set_settings_gate_max_wait(max_wait: Duration) {
+    SETTINGS_GATE_MAX_WAIT_MS.store(
+        u64::try_from(max_wait.as_millis()).unwrap_or(u64::MAX),
+        Ordering::Relaxed,
+    );
+}
+
+/// The current bound on the fail-closed window.
+pub fn settings_gate_max_wait() -> Duration {
+    Duration::from_millis(SETTINGS_GATE_MAX_WAIT_MS.load(Ordering::Relaxed))
+}
+
+/// Close the gate (leader preinit + account switch).
+pub fn suppress_external_otel_until_settings() {
+    GATE_CLOSED_AT_MS.store(process_uptime_ms(), Ordering::Relaxed);
+    // `Release`: a reader that observes the close must also observe the
+    // timestamp published just above, or it would measure this window from an
+    // earlier close and open immediately.
+    SETTINGS_RESOLVED.store(false, Ordering::Release);
+}
+
+/// Open the gate. `Release` publishes the force-disable applied just before it.
+pub fn mark_external_otel_settings_resolved() {
+    if !SETTINGS_RESOLVED.swap(true, Ordering::Release) {
+        tracing::debug!("external otel: settings resolved, emission gate opened");
+    }
+}
+
+/// Read the gate. `Acquire` pairs with the `Release` open (and with the
+/// `Release` close that publishes the window start).
+#[inline]
+pub fn is_settings_gate_open() -> bool {
+    SETTINGS_RESOLVED.load(Ordering::Acquire) || settings_gate_window_expired()
+}
+
+#[cold]
+fn settings_gate_window_expired() -> bool {
+    let waited = process_uptime_ms().saturating_sub(GATE_CLOSED_AT_MS.load(Ordering::Relaxed));
+    if waited < SETTINGS_GATE_MAX_WAIT_MS.load(Ordering::Relaxed) {
+        return false;
+    }
+    static LOGGED: std::sync::Once = std::sync::Once::new();
+    LOGGED.call_once(|| {
+        tracing::warn!(
+            waited_ms = waited,
+            "external otel: no fleet policy arrived within the bounded window; \
+             emitting under local configuration (a policy that arrives later still applies)"
+        );
+    });
+    true
+}
+
 /// Cheap check used by the fan-out hook and the split-sink call sites:
-/// registry present AND the runtime emission gate set. A stale `true` read
-/// only costs a wasted mapping, never an export ([`emit`] re-checks).
+/// registry present AND the runtime emission gate set AND the settings gate
+/// open. A stale `true` read only costs a wasted mapping, never an export
+/// ([`emit`] re-checks).
 pub fn is_active() -> bool {
-    matches!(EXTERNAL.get(), Some(Some(ext)) if ext.active.load(Ordering::Relaxed))
+    is_settings_gate_open()
+        && matches!(EXTERNAL.get(), Some(Some(ext)) if ext.active.load(Ordering::Relaxed))
 }
 
 /// Map and emit one typed telemetry event. No-op unless the stream is active
 /// and the event has an `external = …` mapping. Synchronous and cheap (the
 /// batch processor queues; nothing blocks on I/O).
 pub fn emit<T: crate::events::TelemetryEvent>(data: &T) {
+    // Fail-closed: suppress until the leader confirms the remote policy; open by
+    // default for everyone else.
+    if !is_settings_gate_open() {
+        return;
+    }
     let Some(ext) = active_handle() else {
         return;
     };
@@ -267,8 +385,8 @@ pub(crate) fn set_identity_on(ext: &ExternalTelemetry, attrs: IdentityAttrs) {
 }
 
 /// Apply remote policy when `RemoteSettings` arrive (post-auth, alongside
-/// [`set_identity`]). **TIGHTEN-ONLY**: may clear `active` (fleet kill switch
-/// — flushes, then drops subsequent emissions) and may force content gates
+/// [`set_identity`]). **TIGHTEN-ONLY**: may clear `active` (remote-policy
+/// force-disable, flushes then drops subsequent emissions) and may force content gates
 /// off; it can never enable a stream that env/config left off, and never
 /// loosens gates mid-run.
 pub fn apply_remote_policy(policy: ExternalOtelRemotePolicy) {
@@ -330,7 +448,6 @@ pub fn shutdown() {
     };
     ext.shutdown_once.call_once(|| {
         ext.active.store(false, Ordering::Relaxed);
-        emit_export_health(&ext);
         let logger_provider = ext.logger_provider.clone();
         let meter_provider = ext.meter_provider.clone();
         let (tx, rx) = std::sync::mpsc::channel::<()>();
@@ -352,6 +469,10 @@ pub fn shutdown() {
         if rx.recv_timeout(std::time::Duration::from_secs(2)).is_err() {
             tracing::debug!("external otel: shutdown watchdog expired; abandoning flush thread");
         }
+        // After provider shutdown (which flushes pending batches). Short-lived
+        // CLI exits often only export on this path, so health counters and the
+        // mTLS total-failure warn must run after it — not before.
+        emit_export_health(&ext);
     });
 }
 
@@ -373,9 +494,41 @@ fn emit_export_health(ext: &ExternalTelemetry) {
         export_successes = snapshot.export_successes,
         "external otel: export health"
     );
+    // mTLS misconfig (expired/wrong CA client cert) otherwise looks like a
+    // clean exit with an empty collector. Surface that at warn once on
+    // shutdown when every export attempt failed.
+    if ext.mtls_identity_configured
+        && snapshot.export_failures > 0
+        && snapshot.export_successes == 0
+    {
+        let last_error = health
+            .last_export_error
+            .lock()
+            .clone()
+            .map(|e| crate::redact_common::redact_urls_in_text(&e))
+            .unwrap_or_else(|| "unknown".into());
+        tracing::warn!(
+            logs_endpoint_origin = %ext.configured_meta.logs_endpoint_origin,
+            metrics_endpoint_origin = %ext.configured_meta.metrics_endpoint_origin,
+            export_failures = snapshot.export_failures,
+            last_error = %last_error,
+            "external otel: mTLS identity configured but every export failed"
+        );
+    }
     if tokio::runtime::Handle::try_current().is_ok() {
         crate::session_ctx::log_session_event(snapshot);
     }
+}
+
+/// Snapshot of export-health counters for the active external stream.
+/// `None` when the stream was never activated.
+pub fn export_health() -> Option<ExportHealthSnapshot> {
+    handle().map(|ext| ExportHealthSnapshot {
+        records_dropped: ext.health.records_dropped.load(Ordering::Relaxed),
+        metric_exports_dropped: ext.health.metric_exports_dropped.load(Ordering::Relaxed),
+        export_failures: ext.health.export_failures.load(Ordering::Relaxed),
+        export_successes: ext.health.export_successes.load(Ordering::Relaxed),
+    })
 }
 
 #[cfg(test)]
@@ -433,12 +586,13 @@ pub(crate) mod test_support {
             include_version_on_metrics: false,
             app_version: String::new(),
             health,
+            mtls_identity_configured: false,
             configured_meta: ConfiguredMeta {
                 metrics_exporter: "test",
                 logs_exporter: "test",
                 logs_endpoint_origin: String::new(),
                 metrics_endpoint_origin: String::new(),
-                protocol: "test",
+                protocol: "test".into(),
                 prompts_gate: gates.log_user_prompts,
                 details_gate: gates.log_tool_details,
                 source: "env",

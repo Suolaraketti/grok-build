@@ -7,6 +7,28 @@
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+/// Serializes tests that chdir or assert process-CWD scan results (process-global cwd).
+/// Gated on `metadata` because every caller lives under that feature's test modules
+/// (`gc` / `auto_gc`); without the feature these would be dead under `-D warnings`.
+#[cfg(all(test, feature = "metadata"))]
+pub(crate) static CWD_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+#[cfg(all(test, feature = "metadata"))]
+pub(crate) fn cwd_test_guard() -> std::sync::MutexGuard<'static, ()> {
+    CWD_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// Restores process cwd on drop (pair with [`cwd_test_guard`]).
+#[cfg(all(test, feature = "metadata"))]
+pub(crate) struct CwdGuard(pub PathBuf);
+
+#[cfg(all(test, feature = "metadata"))]
+impl Drop for CwdGuard {
+    fn drop(&mut self) {
+        let _ = std::env::set_current_dir(&self.0);
+    }
+}
+
 use anyhow::Result;
 use tokio_util::sync::CancellationToken;
 
@@ -673,11 +695,22 @@ fn remove_worktree_from_disk(
     if let Some(reg_dir) = registration_dir
         && reg_dir.exists()
     {
-        tracing::debug!(
-            registration_dir = %reg_dir.display(),
-            "removing worktree registration from .git/worktrees/"
-        );
-        let _ = std::fs::remove_dir_all(&reg_dir);
+        // Defense in depth: this path is read from the worktree's own `.git`
+        // pointer, so only remove it when it actually looks like a git
+        // registration dir (`.git/worktrees/<name>`) — never an arbitrary
+        // directory a malformed or crafted pointer names.
+        if reg_dir.parent().and_then(|p| p.file_name()) == Some(std::ffi::OsStr::new("worktrees")) {
+            tracing::debug!(
+                registration_dir = %reg_dir.display(),
+                "removing worktree registration from .git/worktrees/"
+            );
+            let _ = std::fs::remove_dir_all(&reg_dir);
+        } else {
+            tracing::warn!(
+                registration_dir = %reg_dir.display(),
+                "skipping registration cleanup: path is not a .git/worktrees/ entry"
+            );
+        }
     }
 
     Ok(RemoveReport {
@@ -1411,11 +1444,15 @@ pub(crate) fn register_worktree(
             return;
         }
     };
+    // Same canonical path as discovery rebuild / WorktreeDb::get so macOS
+    // /var vs /private/var (and other symlink roots) do not create duplicate rows.
+    let path = dunce::canonicalize(worktree_path).unwrap_or_else(|_| worktree_path.to_path_buf());
+    let source = dunce::canonicalize(source).unwrap_or_else(|_| source.to_path_buf());
     let record = db::WorktreeRecord {
-        id: worktree_id.unwrap_or_else(|| db::id_from_path(worktree_path)),
-        path: worktree_path.to_path_buf(),
-        source_repo: source.to_path_buf(),
-        repo_name: db::repo_name_from_path(source),
+        id: worktree_id.unwrap_or_else(|| db::id_from_path(&path)),
+        path,
+        source_repo: source.clone(),
+        repo_name: db::repo_name_from_path(&source),
         kind,
         creation_mode: creation_mode.to_owned(),
         git_ref: Some(git_ref.to_owned()),
@@ -1435,7 +1472,9 @@ pub(crate) fn register_worktree(
 #[cfg(feature = "metadata")]
 fn unregister_worktree(worktree_path: &std::path::Path) {
     if let Ok(db) = crate::db::WorktreeDb::open_default() {
-        let _ = db.unregister_by_path(worktree_path);
+        let path =
+            dunce::canonicalize(worktree_path).unwrap_or_else(|_| worktree_path.to_path_buf());
+        let _ = db.unregister_by_path(&path);
     }
 }
 
@@ -1471,354 +1510,12 @@ impl BtrfsDelegate for RecordingDelegate {
 }
 
 #[cfg(feature = "metadata")]
-pub mod gc {
-    use std::path::{Path, PathBuf};
-    use std::sync::Arc;
+pub mod gc;
 
-    use anyhow::Result;
-
-    use crate::BtrfsDelegate;
-    use crate::db::{ListFilter, WorktreeDb, WorktreeStatus};
-    use serde::{Deserialize, Serialize};
-
-    #[derive(Clone, Debug, Default, Serialize, Deserialize)]
-    pub struct GcOptions {
-        pub max_age_secs: Option<i64>,
-        pub force: bool,
-        pub dry_run: bool,
-    }
-
-    #[derive(Clone, Debug, Default, Serialize, Deserialize)]
-    pub struct GcReport {
-        pub dead_removed: u64,
-        pub expired_removed: u64,
-        pub skipped_alive: u64,
-        /// Expired worktrees whose on-disk removal failed (e.g. EPERM); the
-        /// record stays tracked for a later retry. serde(default) so reports
-        /// from agents predating this field still deserialize.
-        #[serde(default)]
-        pub remove_failed: u64,
-        // TODO(v2): untracked_found, untracked_registered (via rebuild_worktree_db),
-        // stale_registrations_cleaned (stale .git/worktrees/ cleanup)
-    }
-
-    /// Decode a `kill(pid, 0)` outcome into liveness. `ret == 0` ⇒ the process
-    /// exists. Otherwise: `ESRCH` ⇒ no such process (dead); anything else
-    /// (notably `EPERM`/`EACCES` — exists but owned by another user) ⇒ alive.
-    /// `kill -0`'s exit status can't distinguish `EPERM` from `ESRCH` and wrongly
-    /// reports `EPERM` as dead; split out so this is unit-testable.
-    #[cfg(target_os = "linux")]
-    fn pid_alive_from_kill(ret: i32, errno: i32) -> bool {
-        ret == 0 || errno != libc::ESRCH
-    }
-
-    fn is_pid_alive(pid: u32) -> bool {
-        #[cfg(target_os = "linux")]
-        {
-            // pid 0 targets the caller's process group and pid > i32::MAX wraps to
-            // a negative pid_t (also a process group); neither is a real tracked
-            // pid (creator_pid is always our own process id), so treat as dead.
-            if pid == 0 || pid > i32::MAX as u32 {
-                return false;
-            }
-            // A null signal (sig 0) runs the kernel's existence/permission check
-            // without delivering a signal.
-            let ret = unsafe { libc::kill(pid as libc::pid_t, 0) };
-            let errno = std::io::Error::last_os_error().raw_os_error().unwrap_or(0);
-            pid_alive_from_kill(ret, errno)
-        }
-        #[cfg(not(target_os = "linux"))]
-        {
-            // No libc dependency off Linux; fall back to `kill -0` exit status.
-            let mut cmd = std::process::Command::new("kill");
-            xai_tty_utils::detach_std_command(&mut cmd);
-            cmd.stdin(std::process::Stdio::null());
-            cmd.args(["-0", &pid.to_string()])
-                .stdout(std::process::Stdio::null())
-                .stderr(std::process::Stdio::null())
-                .status()
-                .is_ok_and(|s| s.success())
-        }
-    }
-
-    /// Physical CWDs of every readable running process, via the Linux `/proc`
-    /// scan. Empty on non-Linux — the creator-PID guard still applies.
-    /// Dep-free on purpose (avoids re-adding a process-listing crate just for
-    /// this guard).
-    #[cfg(target_os = "linux")]
-    fn live_process_cwds() -> Vec<PathBuf> {
-        let Ok(entries) = std::fs::read_dir("/proc") else {
-            return Vec::new();
-        };
-        entries
-            .filter_map(Result::ok)
-            // Only numeric `/proc/<pid>` entries expose a `cwd` symlink.
-            .filter(|e| {
-                e.file_name()
-                    .to_str()
-                    .is_some_and(|n| n.parse::<u32>().is_ok())
-            })
-            // An unreadable link (process exited / not permitted) means nothing
-            // is parked there, so drop it.
-            .filter_map(|e| std::fs::read_link(e.path().join("cwd")).ok())
-            .collect()
-    }
-
-    #[cfg(not(target_os = "linux"))]
-    fn live_process_cwds() -> Vec<PathBuf> {
-        Vec::new()
-    }
-
-    /// True if any `live_cwds` entry sits inside `wt_path`. Kernel CWD links are
-    /// physical paths, so also match the canonicalized worktree path — a
-    /// symlinked `$GROK_HOME` or custom worktree path would otherwise never match.
-    fn cwd_within(wt_path: &Path, live_cwds: &[PathBuf]) -> bool {
-        let wt_canon = dunce::canonicalize(wt_path).unwrap_or_else(|_| wt_path.to_path_buf());
-        live_cwds
-            .iter()
-            .any(|cwd| cwd.starts_with(wt_path) || cwd.starts_with(&wt_canon))
-    }
-
-    /// Effective freshness timestamp: the more recent of creation and last
-    /// access (last_accessed_at is never read as older than created_at).
-    fn last_active(rec: &crate::db::WorktreeRecord) -> i64 {
-        rec.last_accessed_at
-            .unwrap_or(rec.created_at)
-            .max(rec.created_at)
-    }
-
-    /// Guarded — must not be reclaimed — when the creator process is still
-    /// running or any live process has its CWD inside the tree.
-    fn is_guarded(rec: &crate::db::WorktreeRecord, live_cwds: &[PathBuf]) -> bool {
-        rec.creator_pid.is_some_and(is_pid_alive) || cwd_within(Path::new(&rec.path), live_cwds)
-    }
-
-    /// Reclaimable only when expired (older than `cutoff` by [`last_active`]) and
-    /// unguarded. Used for the per-candidate re-check against a freshly-read row.
-    fn is_reclaimable(rec: &crate::db::WorktreeRecord, cutoff: i64, live_cwds: &[PathBuf]) -> bool {
-        last_active(rec) < cutoff && !is_guarded(rec, live_cwds)
-    }
-
-    pub fn gc_worktrees(db: &WorktreeDb, opts: &GcOptions) -> Result<GcReport> {
-        gc_worktrees_with_delegate(db, opts, None)
-    }
-
-    /// Like [`gc_worktrees`], but uses `delegate` to reclaim btrfs snapshots in
-    /// the expired path so rootless hosts (no `CAP_SYS_ADMIN`) can delete
-    /// snapshots via a privileged helper instead of leaking them on EPERM.
-    pub fn gc_worktrees_with_delegate(
-        db: &WorktreeDb,
-        opts: &GcOptions,
-        delegate: Option<Arc<dyn BtrfsDelegate>>,
-    ) -> Result<GcReport> {
-        let mut report = GcReport::default();
-        let now = crate::db::now_epoch_secs();
-
-        // Dead-record reclamation.
-        if opts.dry_run {
-            // A dry run must not mutate: skip sweep_dead (which flips records to
-            // dead) and only COUNT what a real run would reclaim — records that
-            // are already dead, or alive with a path that no longer exists (what
-            // sweep_dead would mark dead and then unregister).
-            let all = db.list(&ListFilter {
-                include_dead: true,
-                ..Default::default()
-            })?;
-            report.dead_removed = all
-                .iter()
-                .filter(|r| r.status == WorktreeStatus::Dead || !Path::new(&r.path).exists())
-                .count() as u64;
-        } else {
-            db.sweep_dead()?;
-            let dead = db.list(&ListFilter {
-                status: Some(WorktreeStatus::Dead),
-                include_dead: true,
-                ..Default::default()
-            })?;
-            for rec in dead {
-                // Count only when the row was actually removed.
-                if db.unregister(&rec.id).unwrap_or(false) {
-                    report.dead_removed += 1;
-                }
-            }
-        }
-
-        // Expired alive-worktree reclamation (liveness-guarded).
-        if let Some(max_age) = opts.max_age_secs {
-            // Clamp: a negative max_age must not push the cutoff into the future
-            // (which would expire everything), and an extreme value must not
-            // overflow the subtraction.
-            let cutoff = now.saturating_sub(max_age.max(0));
-            // One process-table scan, reused by the in-tree liveness guard below;
-            // skipped under --force, where the guard never fires.
-            let live_cwds = if opts.force {
-                Vec::new()
-            } else {
-                live_process_cwds()
-            };
-            let alive = db.list(&ListFilter::default())?;
-            for rec in alive {
-                // A worktree touched within the age window must not expire;
-                // callers bump last_accessed_at on use.
-                if last_active(&rec) >= cutoff {
-                    continue;
-                }
-                let path = Path::new(&rec.path);
-                // Cheap first-pass guard against the upfront snapshot; the
-                // per-candidate re-check below re-confirms against a fresh row.
-                if !opts.force && is_guarded(&rec, &live_cwds) {
-                    report.skipped_alive += 1;
-                    continue;
-                }
-                // Dry run: count the candidate without touching disk or DB. Skip
-                // a missing path — a real run sweeps it to dead first, so it's
-                // already counted in dead_removed (don't double-count here).
-                if opts.dry_run {
-                    if path.exists() {
-                        report.expired_removed += 1;
-                    }
-                    continue;
-                }
-                // Re-evaluate against a freshly-read row + live process scan right
-                // before the destructive step: the list snapshot is stale (earlier
-                // removals take time), so a concurrent touch_worktree_for_cwd
-                // (bumps last_accessed_at), a revived creator, or a process that
-                // chdir'd into the tree must still protect it.
-                if !opts.force {
-                    match db.get_by_id(&rec.id) {
-                        Ok(Some(fresh)) => {
-                            if !is_reclaimable(&fresh, cutoff, &live_process_cwds()) {
-                                report.skipped_alive += 1;
-                                continue;
-                            }
-                        }
-                        // Fail closed: a vanished row (concurrently unregistered)
-                        // or an unreadable DB must not green-light a remove.
-                        Ok(None) | Err(_) => continue,
-                    }
-                }
-                if path.exists() {
-                    match super::remove_worktree_with_delegate(path, delegate.clone()) {
-                        Ok(_) => report.expired_removed += 1,
-                        // A failed remove (e.g. EPERM) leaves the record tracked
-                        // for a later retry; surface it instead of reporting zero.
-                        Err(e) => {
-                            tracing::warn!(
-                                path = %path.display(),
-                                error = %e,
-                                "failed to remove expired worktree"
-                            );
-                            report.remove_failed += 1;
-                        }
-                    }
-                } else if db.unregister(&rec.id).unwrap_or(false) {
-                    // Path already gone: drop the stale record.
-                    report.expired_removed += 1;
-                }
-            }
-        }
-
-        Ok(report)
-    }
-
-    #[cfg(test)]
-    mod tests {
-        use super::*;
-
-        #[cfg(target_os = "linux")]
-        #[test]
-        fn pid_alive_from_kill_decodes_errno() {
-            // Testable without needing a process in each errno state.
-            assert!(pid_alive_from_kill(0, 0), "ret==0 ⇒ alive");
-            assert!(!pid_alive_from_kill(-1, libc::ESRCH), "ESRCH ⇒ dead");
-            assert!(
-                pid_alive_from_kill(-1, libc::EPERM),
-                "EPERM ⇒ alive (owned by another user)"
-            );
-            assert!(pid_alive_from_kill(-1, libc::EACCES), "EACCES ⇒ alive");
-        }
-
-        #[test]
-        fn is_pid_alive_true_for_running_processes() {
-            assert!(is_pid_alive(std::process::id()));
-            // PID 1 (init) always exists.
-            #[cfg(target_os = "linux")]
-            assert!(is_pid_alive(1), "init must be detected as alive");
-        }
-
-        #[cfg(target_os = "linux")]
-        #[test]
-        fn is_pid_alive_false_for_guarded_pids() {
-            // pid 0 and pid > i32::MAX are process-group selectors to kill(2), not
-            // real tracked pids; the guard short-circuits them to dead.
-            assert!(!is_pid_alive(0));
-            assert!(!is_pid_alive(u32::MAX));
-        }
-
-        #[test]
-        fn is_pid_alive_false_for_reaped_child() {
-            // A fully reaped child's pid is gone (ESRCH) and must read as dead.
-            let mut child = std::process::Command::new("true")
-                .spawn()
-                .expect("spawn `true`");
-            let pid = child.id();
-            child.wait().expect("wait on `true`");
-            assert!(!is_pid_alive(pid));
-        }
-
-        #[test]
-        fn cwd_within_matches_nested_and_canonical_paths() {
-            let tmp = tempfile::TempDir::new().unwrap();
-            let wt = tmp.path().join("wt");
-            std::fs::create_dir_all(wt.join("a").join("b")).unwrap();
-            // A CWD nested in the tree counts as live; a sibling dir does not.
-            assert!(cwd_within(&wt, &[wt.join("a").join("b")]));
-            assert!(!cwd_within(&wt, &[tmp.path().join("other")]));
-            assert!(!cwd_within(&wt, &[]));
-        }
-
-        fn rec_at(path: &str, created_at: i64) -> crate::db::WorktreeRecord {
-            crate::db::WorktreeRecord {
-                id: "r".to_string(),
-                path: path.into(),
-                source_repo: "/repo".into(),
-                repo_name: "repo".to_string(),
-                kind: crate::db::WorktreeKind::Session,
-                creation_mode: "linked".to_string(),
-                git_ref: None,
-                head_commit: None,
-                session_id: None,
-                creator_pid: None,
-                created_at,
-                last_accessed_at: None,
-                status: WorktreeStatus::Alive,
-                metadata: None,
-            }
-        }
-
-        #[test]
-        fn is_reclaimable_requires_expired_and_unguarded() {
-            let cutoff = 1_000;
-            // Expired (old created_at, never accessed) and unguarded → reclaimable.
-            assert!(is_reclaimable(&rec_at("/no/such/wt", 1), cutoff, &[]));
-            // A recent last_accessed_at within the window protects it.
-            let mut fresh = rec_at("/no/such/wt", 1);
-            fresh.last_accessed_at = Some(cutoff + 10);
-            assert!(!is_reclaimable(&fresh, cutoff, &[]));
-            // A live creator pid protects it.
-            let mut live_creator = rec_at("/no/such/wt", 1);
-            live_creator.creator_pid = Some(std::process::id());
-            assert!(!is_reclaimable(&live_creator, cutoff, &[]));
-            // A live process CWD inside the tree protects it.
-            let inside = std::path::PathBuf::from("/no/such/wt/sub");
-            assert!(!is_reclaimable(
-                &rec_at("/no/such/wt", 1),
-                cutoff,
-                &[inside]
-            ));
-        }
-    }
-}
+// GC behavior suite, co-located with the GC implementation under `gc/`.
+#[cfg(all(test, feature = "metadata"))]
+#[path = "api/gc/integration_tests.rs"]
+mod gc_integration_tests;
 
 #[cfg(test)]
 mod tests {
@@ -2225,6 +1922,37 @@ mod tests {
             deletes.load(std::sync::atomic::Ordering::Relaxed),
             0,
             "delegate is a fallback only; a plain worktree removal must not call it"
+        );
+    }
+
+    /// The registration cleanup removes a path read from the worktree's own
+    /// `.git` pointer, so a pointer whose parent is not `worktrees` (malformed or
+    /// crafted) must be skipped, never `remove_dir_all`'d.
+    #[test]
+    fn a_gitdir_pointer_outside_worktrees_is_not_removed() {
+        #[cfg(feature = "metadata")]
+        let _fx = crate::db::GrokHomeFixture::new();
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        let victim = tmp.path().join("precious");
+        std::fs::create_dir_all(&victim).unwrap();
+        std::fs::write(victim.join("keep.txt"), b"do not delete").unwrap();
+
+        // A worktree whose `.git` points at `victim`, which is not a
+        // `.git/worktrees/<name>` registration dir.
+        let wt = tmp.path().join("wt");
+        std::fs::create_dir_all(&wt).unwrap();
+        std::fs::write(wt.join(".git"), format!("gitdir: {}\n", victim.display())).unwrap();
+
+        remove_worktree(&wt).unwrap();
+
+        assert!(
+            !wt.exists(),
+            "the worktree directory itself is still removed"
+        );
+        assert!(
+            victim.join("keep.txt").exists(),
+            "a pointer whose parent is not `worktrees` must not be removed"
         );
     }
 
@@ -2822,786 +2550,5 @@ mod tests {
         );
         assert!(result.is_ok());
         assert!(result.unwrap().is_none());
-    }
-
-    #[cfg(feature = "metadata")]
-    mod metadata_integration {
-        use super::*;
-        use crate::db::{ListFilter, WorktreeDb, WorktreeKind};
-
-        fn db_at(tmp: &tempfile::TempDir) -> WorktreeDb {
-            WorktreeDb::open(tmp.path()).unwrap()
-        }
-
-        #[test]
-        fn register_worktree_writes_correct_fields() {
-            // Isolate GROK_HOME so register_worktree's open_default write lands
-            // in our own DB (lock + private tmp + restore via the fixture).
-            let fx = crate::db::GrokHomeFixture::new();
-
-            // Unique basename → unique id, so a concurrent open_default writer
-            // (GROK_HOME is process-global) can't INSERT-OR-REPLACE our row.
-            let wt_path = fx.home.join("register-fields-wt");
-            std::fs::create_dir(&wt_path).unwrap();
-
-            super::super::register_worktree(
-                &wt_path,
-                std::path::Path::new("/src/repo"),
-                WorktreeKind::Session,
-                "linked",
-                "main",
-                "abc123",
-                Some("test-session".to_string()),
-                None,
-                None,
-            );
-
-            // register_worktree wrote to open_default, which resolves to fx.home.
-            // Filter to OUR record by path: concurrent tests may add rows here.
-            let db = WorktreeDb::open(&fx.home).unwrap();
-            let mine: Vec<_> = db
-                .list(&ListFilter::default())
-                .unwrap()
-                .into_iter()
-                .filter(|r| r.path == wt_path)
-                .collect();
-            assert_eq!(mine.len(), 1);
-            assert_eq!(mine[0].kind, WorktreeKind::Session);
-            assert_eq!(mine[0].session_id.as_deref(), Some("test-session"));
-            assert_eq!(mine[0].creation_mode, "linked");
-            assert_eq!(mine[0].head_commit.as_deref(), Some("abc123"));
-            assert!(mine[0].creator_pid.is_some());
-        }
-
-        #[test]
-        fn unregister_worktree_removes_by_path() {
-            let tmp = tempfile::TempDir::new().unwrap();
-            let db = db_at(&tmp);
-            let wt_path = tmp.path().join("wt");
-
-            let record = crate::db::WorktreeRecord {
-                id: "test-wt".to_string(),
-                path: wt_path.clone(),
-                source_repo: "/repo".into(),
-                repo_name: "repo".to_string(),
-                kind: WorktreeKind::Session,
-                creation_mode: "linked".to_string(),
-                git_ref: None,
-                head_commit: None,
-                session_id: None,
-                creator_pid: None,
-                created_at: 100,
-                last_accessed_at: None,
-                status: crate::db::WorktreeStatus::Alive,
-                metadata: None,
-            };
-            db.register(&record).unwrap();
-            assert_eq!(db.list(&ListFilter::default()).unwrap().len(), 1);
-
-            db.unregister_by_path(&wt_path).unwrap();
-            assert!(db.list(&ListFilter::default()).unwrap().is_empty());
-        }
-
-        #[test]
-        fn creation_mode_as_db_str_matches_schema() {
-            assert_eq!(CreationMode::Linked.as_db_str(), "linked");
-            assert_eq!(CreationMode::Standalone.as_db_str(), "standalone");
-            assert_eq!(CreationMode::GitCheckout.as_db_str(), "git");
-        }
-
-        #[test]
-        fn gc_removes_dead_records() {
-            let tmp = tempfile::TempDir::new().unwrap();
-            let db = db_at(&tmp);
-
-            // Register a record with a nonexistent path
-            let record = crate::db::WorktreeRecord {
-                id: "dead-1".to_string(),
-                path: "/nonexistent/worktree".into(),
-                source_repo: "/repo".into(),
-                repo_name: "repo".to_string(),
-                kind: WorktreeKind::Session,
-                creation_mode: "linked".to_string(),
-                git_ref: None,
-                head_commit: None,
-                session_id: None,
-                creator_pid: None,
-                created_at: 100,
-                last_accessed_at: None,
-                status: crate::db::WorktreeStatus::Alive,
-                metadata: None,
-            };
-            db.register(&record).unwrap();
-
-            let report = gc::gc_worktrees(&db, &gc::GcOptions::default()).unwrap();
-            assert_eq!(report.dead_removed, 1);
-
-            let all = db
-                .list(&ListFilter {
-                    include_dead: true,
-                    ..Default::default()
-                })
-                .unwrap();
-            assert!(all.is_empty());
-        }
-
-        #[test]
-        fn gc_skips_alive_pids() {
-            let tmp = tempfile::TempDir::new().unwrap();
-            let db = db_at(&tmp);
-            let my_pid = std::process::id();
-
-            let record = crate::db::WorktreeRecord {
-                id: "alive-wt".to_string(),
-                path: "/nonexistent/path".into(),
-                source_repo: "/repo".into(),
-                repo_name: "repo".to_string(),
-                kind: WorktreeKind::Session,
-                creation_mode: "linked".to_string(),
-                git_ref: None,
-                head_commit: None,
-                session_id: None,
-                creator_pid: Some(my_pid),
-                created_at: 1, // very old
-                last_accessed_at: None,
-                status: crate::db::WorktreeStatus::Alive,
-                metadata: None,
-            };
-            db.register(&record).unwrap();
-
-            // sweep_dead will mark it dead (path doesn't exist),
-            // but gc with max_age should still check liveness for expiry.
-            // Since the path doesn't exist, sweep_dead marks it dead first,
-            // then dead_removed cleans it. Let's use a real existing path instead.
-            let dir = tmp.path().join("real-wt");
-            std::fs::create_dir(&dir).unwrap();
-            let mut record2 = record.clone();
-            record2.id = "alive-wt2".to_string();
-            record2.path = dir.clone();
-            db.register(&record2).unwrap();
-
-            let report = gc::gc_worktrees(
-                &db,
-                &gc::GcOptions {
-                    max_age_secs: Some(0), // everything is expired
-                    force: false,
-                    dry_run: false,
-                },
-            )
-            .unwrap();
-
-            // Our PID is alive, so the real-path worktree should be skipped
-            assert_eq!(report.skipped_alive, 1);
-            // The nonexistent-path one gets swept to dead then removed
-            assert_eq!(report.dead_removed, 1);
-        }
-
-        #[test]
-        fn gc_dry_run_preserves_records() {
-            let tmp = tempfile::TempDir::new().unwrap();
-            let db = db_at(&tmp);
-
-            let record = crate::db::WorktreeRecord {
-                id: "dry-1".to_string(),
-                path: "/nonexistent".into(),
-                source_repo: "/repo".into(),
-                repo_name: "repo".to_string(),
-                kind: WorktreeKind::Session,
-                creation_mode: "linked".to_string(),
-                git_ref: None,
-                head_commit: None,
-                session_id: None,
-                creator_pid: None,
-                created_at: 100,
-                last_accessed_at: None,
-                status: crate::db::WorktreeStatus::Alive,
-                metadata: None,
-            };
-            db.register(&record).unwrap();
-
-            let report = gc::gc_worktrees(
-                &db,
-                &gc::GcOptions {
-                    dry_run: true,
-                    ..Default::default()
-                },
-            )
-            .unwrap();
-
-            assert_eq!(report.dead_removed, 1); // counted as would-be-removed
-            // Dry run must NOT mutate: the record is still present AND still
-            // Alive (it was never swept to Dead).
-            let all = db
-                .list(&ListFilter {
-                    include_dead: true,
-                    ..Default::default()
-                })
-                .unwrap();
-            assert_eq!(all.len(), 1);
-            assert_eq!(all[0].status, crate::db::WorktreeStatus::Alive);
-        }
-
-        #[test]
-        fn gc_force_overrides_liveness() {
-            let tmp = tempfile::TempDir::new().unwrap();
-            let db = db_at(&tmp);
-
-            let dir = tmp.path().join("force-wt");
-            std::fs::create_dir(&dir).unwrap();
-
-            let record = crate::db::WorktreeRecord {
-                id: "force-1".to_string(),
-                path: dir.clone(),
-                source_repo: "/repo".into(),
-                repo_name: "repo".to_string(),
-                kind: WorktreeKind::Session,
-                creation_mode: "linked".to_string(),
-                git_ref: None,
-                head_commit: None,
-                session_id: None,
-                creator_pid: Some(std::process::id()), // our own PID
-                created_at: 1,                         // very old
-                last_accessed_at: None,
-                status: crate::db::WorktreeStatus::Alive,
-                metadata: None,
-            };
-            db.register(&record).unwrap();
-
-            let report = gc::gc_worktrees(
-                &db,
-                &gc::GcOptions {
-                    max_age_secs: Some(0),
-                    force: true,
-                    dry_run: false,
-                },
-            )
-            .unwrap();
-
-            assert_eq!(report.expired_removed, 1);
-            assert_eq!(report.skipped_alive, 0);
-        }
-
-        #[test]
-        fn gc_clamps_extreme_max_age_without_overflow() {
-            let tmp = tempfile::TempDir::new().unwrap();
-            let db = db_at(&tmp);
-            let dir = tmp.path().join("fresh-wt");
-            std::fs::create_dir(&dir).unwrap();
-            let record = crate::db::WorktreeRecord {
-                id: "fresh-1".to_string(),
-                path: dir.clone(),
-                source_repo: "/repo".into(),
-                repo_name: "repo".to_string(),
-                kind: WorktreeKind::Session,
-                creation_mode: "linked".to_string(),
-                git_ref: None,
-                head_commit: None,
-                session_id: None,
-                creator_pid: None,
-                created_at: i64::MAX,
-                last_accessed_at: None,
-                status: crate::db::WorktreeStatus::Alive,
-                metadata: None,
-            };
-            db.register(&record).unwrap();
-            // `now - i64::MIN` would overflow/wrap the cutoff into the future and
-            // reclaim everything; the clamp treats any negative age as 0 so the
-            // cutoff is `now` and nothing fresh is reclaimed (and no panic).
-            let report = gc::gc_worktrees(
-                &db,
-                &gc::GcOptions {
-                    max_age_secs: Some(i64::MIN),
-                    force: false,
-                    dry_run: false,
-                },
-            )
-            .unwrap();
-            assert_eq!(report.expired_removed, 0);
-            assert!(dir.exists());
-        }
-
-        #[test]
-        fn gc_honors_last_accessed_time() {
-            let tmp = tempfile::TempDir::new().unwrap();
-            let db = db_at(&tmp);
-            let fresh = tmp.path().join("fresh-access");
-            let stale = tmp.path().join("stale-access");
-            std::fs::create_dir(&fresh).unwrap();
-            std::fs::create_dir(&stale).unwrap();
-            let base = crate::db::WorktreeRecord {
-                id: String::new(),
-                path: std::path::PathBuf::new(),
-                source_repo: "/repo".into(),
-                repo_name: "repo".to_string(),
-                kind: WorktreeKind::Session,
-                creation_mode: "linked".to_string(),
-                git_ref: None,
-                head_commit: None,
-                session_id: None,
-                creator_pid: None, // no liveness guard: isolate the age logic
-                created_at: 1,     // both are old by creation time
-                last_accessed_at: None,
-                status: crate::db::WorktreeStatus::Alive,
-                metadata: None,
-            };
-            db.register(&crate::db::WorktreeRecord {
-                id: "fresh".to_string(),
-                path: fresh.clone(),
-                last_accessed_at: Some(i64::MAX), // touched within the window
-                ..base.clone()
-            })
-            .unwrap();
-            db.register(&crate::db::WorktreeRecord {
-                id: "stale".to_string(),
-                path: stale.clone(),
-                last_accessed_at: Some(1), // never re-touched
-                ..base
-            })
-            .unwrap();
-
-            let report = gc::gc_worktrees(
-                &db,
-                &gc::GcOptions {
-                    max_age_secs: Some(0),
-                    force: false,
-                    dry_run: false,
-                },
-            )
-            .unwrap();
-
-            assert!(
-                fresh.exists(),
-                "a recently accessed worktree must survive despite an old created_at"
-            );
-            assert!(
-                !stale.exists(),
-                "a never-touched expired worktree must be reclaimed"
-            );
-            assert_eq!(report.expired_removed, 1);
-        }
-
-        #[cfg(target_os = "linux")]
-        #[test]
-        fn gc_cwd_guard_skips_then_reclaims_expired_worktree() {
-            use std::time::Duration;
-            let tmp = tempfile::TempDir::new().unwrap();
-            let db = db_at(&tmp);
-            let dir = tmp.path().join("cwd-wt");
-            let nested = dir.join("nested");
-            std::fs::create_dir_all(&nested).unwrap();
-            let record = crate::db::WorktreeRecord {
-                id: "cwd-1".to_string(),
-                path: dir.clone(),
-                source_repo: "/repo".into(),
-                repo_name: "repo".to_string(),
-                kind: WorktreeKind::Session,
-                creation_mode: "linked".to_string(),
-                git_ref: None,
-                head_commit: None,
-                session_id: None,
-                creator_pid: None, // creator gone: only the CWD guard can protect it
-                created_at: 1,     // very old → expired
-                last_accessed_at: None,
-                status: crate::db::WorktreeStatus::Alive,
-                metadata: None,
-            };
-            db.register(&record).unwrap();
-
-            // A live process parked inside the expired worktree subtree.
-            let mut child = std::process::Command::new("sleep")
-                .arg("30")
-                .current_dir(&nested)
-                .spawn()
-                .expect("spawn sleep");
-            // Wait for the kernel to reflect the child's CWD before GC scans.
-            let want = dunce::canonicalize(&nested).unwrap();
-            let link = format!("/proc/{}/cwd", child.id());
-            for _ in 0..200 {
-                if std::fs::read_link(&link).is_ok_and(|p| p.starts_with(&want)) {
-                    break;
-                }
-                std::thread::sleep(Duration::from_millis(10));
-            }
-
-            let opts = gc::GcOptions {
-                max_age_secs: Some(0),
-                force: false,
-                dry_run: false,
-            };
-            let guarded = gc::gc_worktrees(&db, &opts).unwrap();
-            assert_eq!(
-                guarded.skipped_alive, 1,
-                "a live in-tree CWD must protect the expired worktree"
-            );
-            assert_eq!(guarded.expired_removed, 0);
-            assert!(dir.exists());
-
-            // Once the process exits, the same expired worktree is reclaimed.
-            child.kill().ok();
-            child.wait().ok();
-            let reclaimed = gc::gc_worktrees(&db, &opts).unwrap();
-            assert_eq!(
-                reclaimed.expired_removed, 1,
-                "no live process inside ⇒ the expired worktree is reclaimed"
-            );
-            assert!(!dir.exists());
-        }
-
-        #[test]
-        fn gc_dry_run_with_max_age_does_not_remove_expired() {
-            // An expired worktree whose dir exists must be previewed (counted)
-            // but never removed under dry_run.
-            let tmp = tempfile::TempDir::new().unwrap();
-            let db = db_at(&tmp);
-
-            let dir = tmp.path().join("expired-wt");
-            std::fs::create_dir(&dir).unwrap();
-
-            let record = crate::db::WorktreeRecord {
-                id: "expired-1".to_string(),
-                path: dir.clone(),
-                source_repo: "/repo".into(),
-                repo_name: "repo".to_string(),
-                kind: WorktreeKind::Session,
-                creation_mode: "linked".to_string(),
-                git_ref: None,
-                head_commit: None,
-                session_id: None,
-                creator_pid: None, // no liveness guard
-                created_at: 1,     // very old
-                last_accessed_at: None,
-                status: crate::db::WorktreeStatus::Alive,
-                metadata: None,
-            };
-            db.register(&record).unwrap();
-
-            let report = gc::gc_worktrees(
-                &db,
-                &gc::GcOptions {
-                    max_age_secs: Some(0),
-                    force: true,
-                    dry_run: true,
-                },
-            )
-            .unwrap();
-
-            assert_eq!(
-                report.expired_removed, 1,
-                "dry run should count the candidate"
-            );
-            // No mutation: the dir and the (still Alive) record both survive.
-            assert!(dir.exists(), "dry run must not remove the worktree dir");
-            let all = db.list(&ListFilter::default()).unwrap();
-            assert_eq!(all.len(), 1);
-            assert_eq!(all[0].status, crate::db::WorktreeStatus::Alive);
-        }
-
-        #[test]
-        fn gc_dry_run_missing_and_expired_counted_once() {
-            // A record that is Alive, has a MISSING path, AND is expired must be
-            // counted EXACTLY once (a real run sweeps it to dead and unregisters
-            // it before the expired loop). It belongs to dead_removed, not both.
-            let tmp = tempfile::TempDir::new().unwrap();
-            let db = db_at(&tmp);
-
-            let record = crate::db::WorktreeRecord {
-                id: "missing-expired".to_string(),
-                path: "/nonexistent/expired-wt".into(),
-                source_repo: "/repo".into(),
-                repo_name: "repo".to_string(),
-                kind: WorktreeKind::Session,
-                creation_mode: "linked".to_string(),
-                git_ref: None,
-                head_commit: None,
-                session_id: None,
-                creator_pid: None,
-                created_at: 1, // very old → expired
-                last_accessed_at: None,
-                status: crate::db::WorktreeStatus::Alive,
-                metadata: None,
-            };
-            db.register(&record).unwrap();
-
-            let report = gc::gc_worktrees(
-                &db,
-                &gc::GcOptions {
-                    max_age_secs: Some(0),
-                    force: true,
-                    dry_run: true,
-                },
-            )
-            .unwrap();
-
-            assert_eq!(
-                report.dead_removed, 1,
-                "missing path counts as would-be-dead"
-            );
-            assert_eq!(
-                report.expired_removed, 0,
-                "must not also be counted in expired_removed"
-            );
-        }
-
-        #[test]
-        fn gc_expired_failed_removal_keeps_record() {
-            // When the expired worktree can't be removed, expired_removed must
-            // NOT be counted and the DB record must survive (so it stays
-            // visible to a later gc).
-            let tmp = tempfile::TempDir::new().unwrap();
-            let db = db_at(&tmp);
-
-            // A regular file makes remove_worktree's `remove_dir_all` fail
-            // (ENOTDIR) deterministically, even as root.
-            let path = tmp.path().join("doomed-wt");
-            std::fs::write(&path, b"not a dir").unwrap();
-
-            let record = crate::db::WorktreeRecord {
-                id: "doomed-1".to_string(),
-                path: path.clone(),
-                source_repo: "/repo".into(),
-                repo_name: "repo".to_string(),
-                kind: WorktreeKind::Session,
-                creation_mode: "linked".to_string(),
-                git_ref: None,
-                head_commit: None,
-                session_id: None,
-                creator_pid: None,
-                created_at: 1,
-                last_accessed_at: None,
-                status: crate::db::WorktreeStatus::Alive,
-                metadata: None,
-            };
-            db.register(&record).unwrap();
-
-            let report = gc::gc_worktrees(
-                &db,
-                &gc::GcOptions {
-                    max_age_secs: Some(0),
-                    force: true,
-                    dry_run: false,
-                },
-            )
-            .unwrap();
-
-            assert_eq!(
-                report.expired_removed, 0,
-                "a failed removal must not be counted"
-            );
-            assert_eq!(
-                report.remove_failed, 1,
-                "a failed removal must be surfaced in remove_failed"
-            );
-            let all = db.list(&ListFilter::default()).unwrap();
-            assert_eq!(all.len(), 1, "record must survive a failed removal");
-            assert!(path.exists(), "the un-removable path is still present");
-        }
-
-        /// True if a record with `path` exists in the DB (assert on our own
-        /// record rather than total count: other tests may write to the same
-        /// open_default DB concurrently).
-        fn record_present(db: &WorktreeDb, path: &std::path::Path) -> bool {
-            db.list(&ListFilter::default())
-                .unwrap()
-                .iter()
-                .any(|r| r.path == path)
-        }
-
-        #[test]
-        fn db_record_survives_failed_removal() {
-            // remove_worktree must keep the DB record when the on-disk removal
-            // fails, so the worktree isn't lost from tracking while leaking on
-            // disk (unregister only after a successful removal).
-            let fx = crate::db::GrokHomeFixture::new();
-
-            // A regular file makes remove_dir_all fail (ENOTDIR) deterministically.
-            let wt_path = fx.home.join("doomed-wt");
-            std::fs::write(&wt_path, b"not a dir").unwrap();
-
-            // Register via the production registration path (uses open_default).
-            super::super::register_worktree(
-                &wt_path,
-                std::path::Path::new("/src/repo"),
-                WorktreeKind::Session,
-                "linked",
-                "main",
-                "abc123",
-                None,
-                None,
-                None,
-            );
-            let db = WorktreeDb::open(&fx.home).unwrap();
-            assert!(
-                record_present(&db, &wt_path),
-                "precondition: record registered"
-            );
-
-            assert!(
-                crate::remove_worktree(&wt_path).is_err(),
-                "removing a non-directory path must fail"
-            );
-
-            assert!(
-                record_present(&db, &wt_path),
-                "record must survive a failed removal"
-            );
-        }
-
-        #[test]
-        fn db_record_removed_after_successful_removal() {
-            // The success direction: a removable worktree must still be
-            // unregistered from the DB (catches a regression dropping the
-            // unregister).
-            xai_test_utils::require_git!();
-            use xai_test_utils::git::{git_commit_all, init_git_repo};
-
-            let fx = crate::db::GrokHomeFixture::new();
-
-            // A real repo + a real worktree so remove_worktree succeeds on disk.
-            let repo = fx.home.join("repo");
-            std::fs::create_dir(&repo).unwrap();
-            init_git_repo(&repo);
-            std::fs::write(repo.join("f.txt"), "x").unwrap();
-            git_commit_all(&repo, "init");
-            let wt_path = fx.home.join("live-wt");
-            crate::WorktreeBuilder::new(&repo, &wt_path)
-                .create()
-                .unwrap();
-
-            super::super::register_worktree(
-                &wt_path,
-                &repo,
-                WorktreeKind::Session,
-                "linked",
-                "main",
-                "abc123",
-                None,
-                None,
-                None,
-            );
-            let db = WorktreeDb::open(&fx.home).unwrap();
-            assert!(
-                record_present(&db, &wt_path),
-                "precondition: record registered"
-            );
-
-            crate::remove_worktree(&wt_path).unwrap();
-
-            assert!(!wt_path.exists(), "worktree dir should be gone");
-            assert!(
-                !record_present(&db, &wt_path),
-                "a successful removal must unregister the DB record"
-            );
-        }
-
-        #[test]
-        fn gc_with_delegate_removes_expired_and_unregisters() {
-            // gc_worktrees_with_delegate threads the delegate through the expired
-            // path and, on a successful removal, counts it and drops the record.
-            // (The delegate's btrfs fallback only fires on a real btrfs-delete
-            // failure, which needs a btrfs host; here the plain-dir fast path
-            // succeeds, so the mock's delete_snapshot is not called.)
-            use std::sync::atomic::{AtomicUsize, Ordering};
-
-            // GROK_HOME == the gc DB dir so remove_worktree's open_default
-            // unregister hits the same DB the gc record lives in.
-            let fx = crate::db::GrokHomeFixture::new();
-            let db = WorktreeDb::open(&fx.home).unwrap();
-
-            let dir = fx.home.join("expired-wt");
-            std::fs::create_dir(&dir).unwrap();
-            let record = crate::db::WorktreeRecord {
-                id: "expired-del-1".to_string(),
-                path: dir.clone(),
-                source_repo: "/repo".into(),
-                repo_name: "repo".to_string(),
-                kind: WorktreeKind::Session,
-                creation_mode: "linked".to_string(),
-                git_ref: None,
-                head_commit: None,
-                session_id: None,
-                creator_pid: None,
-                created_at: 1, // very old → expired
-                last_accessed_at: None,
-                status: crate::db::WorktreeStatus::Alive,
-                metadata: None,
-            };
-            db.register(&record).unwrap();
-
-            let deletes = Arc::new(AtomicUsize::new(0));
-            let delegate: Arc<dyn BtrfsDelegate> = Arc::new(super::super::RecordingDelegate {
-                snapshot_path: fx.home.join("unused-snap"),
-                worktree_path: dir.clone(),
-                deletes: Arc::clone(&deletes),
-            });
-
-            let report = gc::gc_worktrees_with_delegate(
-                &db,
-                &gc::GcOptions {
-                    max_age_secs: Some(0),
-                    force: true,
-                    dry_run: false,
-                },
-                Some(delegate),
-            )
-            .unwrap();
-
-            assert_eq!(
-                report.expired_removed, 1,
-                "expired worktree should be reclaimed"
-            );
-            assert!(!dir.exists(), "the worktree dir should be removed");
-            assert!(
-                db.get("expired-del-1").unwrap().is_none(),
-                "the DB record should be unregistered after a successful removal"
-            );
-            // Plain-dir fast path succeeds without needing the delegate fallback.
-            assert_eq!(deletes.load(Ordering::Relaxed), 0);
-        }
-
-        #[test]
-        fn gc_report_serde_round_trip() {
-            let report = gc::GcReport {
-                dead_removed: 3,
-                expired_removed: 1,
-                skipped_alive: 2,
-                remove_failed: 4,
-            };
-            let json = serde_json::to_string(&report).unwrap();
-            let deser: gc::GcReport = serde_json::from_str(&json).unwrap();
-            assert_eq!(deser.dead_removed, 3);
-            assert_eq!(deser.expired_removed, 1);
-            assert_eq!(deser.skipped_alive, 2);
-            assert_eq!(deser.remove_failed, 4);
-        }
-
-        #[test]
-        fn gc_options_serde_round_trip() {
-            let opts = gc::GcOptions {
-                max_age_secs: Some(86400),
-                force: true,
-                dry_run: false,
-            };
-            let json = serde_json::to_string(&opts).unwrap();
-            let deser: gc::GcOptions = serde_json::from_str(&json).unwrap();
-            assert_eq!(deser.max_age_secs, Some(86400));
-            assert!(deser.force);
-            assert!(!deser.dry_run);
-        }
-
-        #[test]
-        fn db_stats_serde_round_trip() {
-            let stats = crate::db::DbStats {
-                total_records: 10,
-                alive_count: 7,
-                dead_count: 3,
-                db_file_bytes: 4096,
-            };
-            let json = serde_json::to_string(&stats).unwrap();
-            let deser: crate::db::DbStats = serde_json::from_str(&json).unwrap();
-            assert_eq!(deser.total_records, 10);
-            assert_eq!(deser.alive_count, 7);
-            assert_eq!(deser.dead_count, 3);
-            assert_eq!(deser.db_file_bytes, 4096);
-        }
     }
 }
