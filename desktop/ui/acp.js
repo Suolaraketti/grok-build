@@ -32,6 +32,7 @@ export class AgentClient {
     this.onSessionUpdate = () => {};
     this.onSessionNotification = () => {}; // x.ai/session_notification (retries, compaction, ...)
     this.onPermissionRequest = async () => ({ outcome: "cancelled" });
+    this.onYoloModeChanged = () => {};
     this.onExit = () => {};
     this.onStderr = () => {};
 
@@ -73,6 +74,10 @@ export class AgentClient {
         terminal: false,
       },
       clientInfo: { name: "grok-build-desktop", version: "1.0.1" },
+      _meta: {
+        clientType: "grok-desktop",
+        clientIdentifier: "grok-desktop",
+      },
     });
     this.authMethods = this.initializeResult.authMethods || [];
     return this.initializeResult;
@@ -94,8 +99,12 @@ export class AgentClient {
 
   // ---- ACP core ----
 
-  async newSession(cwd) {
-    return await this.request("session/new", { cwd, mcpServers: [] });
+  async newSession(cwd, meta = {}) {
+    return await this.request("session/new", {
+      cwd,
+      mcpServers: [],
+      _meta: meta,
+    });
   }
 
   // Restore a stored session for continuation. The agent replays the whole
@@ -105,11 +114,13 @@ export class AgentClient {
     return await this.request("session/load", { sessionId, cwd, mcpServers: [] });
   }
 
-  async prompt(sessionId, text) {
-    return await this.request("session/prompt", {
+  async prompt(sessionId, text, meta = {}) {
+    const params = {
       sessionId,
       prompt: [{ type: "text", text }],
-    });
+    };
+    if (meta && Object.keys(meta).length) params._meta = meta;
+    return await this.request("session/prompt", params);
   }
 
   cancel(sessionId) {
@@ -118,6 +129,19 @@ export class AgentClient {
 
   async setModel(sessionId, modelId) {
     return await this.request("session/set_model", { sessionId, modelId });
+  }
+
+  async setMode(sessionId, modeId) {
+    return await this.request("session/set_mode", { sessionId, modeId });
+  }
+
+  // Notification (no response). The shell flips session yolo/auto flags.
+  yoloModeChanged({ yoloMode, autoMode, permissionMode } = {}) {
+    const params = { clientIdentifier: "grok-desktop" };
+    if (yoloMode !== undefined) params.yolo_mode = !!yoloMode;
+    if (autoMode !== undefined) params.auto_mode = !!autoMode;
+    if (permissionMode) params.permission_mode = permissionMode;
+    this._send({ jsonrpc: "2.0", method: "_x.ai/yolo_mode_changed", params });
   }
 
   // Slash commands advertised by the agent (initialize._meta.availableCommands,
@@ -232,6 +256,11 @@ export class AgentClient {
     ) {
       // Session-level side channel: retry/backoff state, auto-compaction, etc.
       this.onSessionNotification(msg.params);
+    } else if (
+      msg.method === "_x.ai/yolo_mode_changed" ||
+      msg.method === "x.ai/yolo_mode_changed"
+    ) {
+      this.onYoloModeChanged(msg.params || {});
     }
   }
 

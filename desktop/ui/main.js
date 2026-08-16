@@ -8,7 +8,8 @@
 "use strict";
 
 import { AgentClient, METHOD, agentBinaryInfo, pickFolder, homeDir, listStoredSessions, openExternal } from "./acp.js";
-import { renderMarkdown } from "./markdown.js";
+import { createMdStream, updateMdStream } from "./markdown.js";
+import { unifiedLineDiff } from "./diff.js";
 
 const $ = (id) => document.getElementById(id);
 const client = new AgentClient();
@@ -20,6 +21,11 @@ const prefs = {
   set model(v) { v ? localStorage.setItem("grok.model", v) : localStorage.removeItem("grok.model"); },
   get alwaysApprove() { return localStorage.getItem("grok.alwaysApprove") === "1"; },
   set alwaysApprove(v) { localStorage.setItem("grok.alwaysApprove", v ? "1" : "0"); },
+  get mode() { return localStorage.getItem("grok.mode") || "default"; },
+  set mode(v) {
+    const id = v === "ask" || v === "plan" ? v : "default";
+    localStorage.setItem("grok.mode", id);
+  },
 };
 
 const state = {
@@ -33,6 +39,7 @@ const state = {
   commands: [], // slash commands advertised by the agent
   billing: null, // {at, data|error}
   stored: [], // past sessions from ~/.grok/sessions (via list_sessions)
+  restarting: false,
 };
 
 const SUGGESTIONS = [
@@ -85,16 +92,10 @@ async function boot() {
 
   // Already authenticated? cached_token / xai.api_key are only advertised when
   // valid credentials exist, so activating them never opens a browser.
-  const silent = client.hasAuthMethod(METHOD.CACHED_TOKEN)
-    ? METHOD.CACHED_TOKEN
-    : client.hasAuthMethod(METHOD.API_KEY)
-    ? METHOD.API_KEY
-    : null;
-
-  if (silent) {
+  if (hasSilentAuth()) {
     $("boot-text").textContent = "Signing you in…";
     try {
-      await client.authenticate(silent, {});
+      await silentAuth();
       await enterApp();
       return;
     } catch {
@@ -103,6 +104,22 @@ async function boot() {
   }
 
   presentSignin();
+}
+
+function silentAuthMethod() {
+  if (client.hasAuthMethod(METHOD.CACHED_TOKEN)) return METHOD.CACHED_TOKEN;
+  if (client.hasAuthMethod(METHOD.API_KEY)) return METHOD.API_KEY;
+  return null;
+}
+
+function hasSilentAuth() {
+  return !!silentAuthMethod();
+}
+
+async function silentAuth() {
+  const method = silentAuthMethod();
+  if (!method) throw new Error("No silent auth method available");
+  await client.authenticate(method, {});
 }
 
 function presentSignin() {
@@ -300,6 +317,7 @@ async function enterApp() {
   if (state.folder && !state.chats.length) await newChat();
   updateEmptyState();
   updateComposer();
+  updateModeSeg();
   $("prompt-input").focus();
 }
 
@@ -402,11 +420,107 @@ function openSettings() {
   $("set-model").value = prefs.model;
   $("settings-overlay").classList.remove("hidden");
 }
-$("settings-close").addEventListener("click", () => {
-  prefs.alwaysApprove = $("set-yolo").checked;
-  prefs.model = $("set-model").value.trim();
+
+function closeSettings(apply) {
   $("settings-overlay").classList.add("hidden");
+  if (!apply) return;
+  const nextYolo = $("set-yolo").checked;
+  const nextModel = $("set-model").value.trim();
+  const yoloChanged = nextYolo !== prefs.alwaysApprove;
+  const modelChanged = nextModel !== prefs.model;
+  prefs.alwaysApprove = nextYolo;
+  prefs.model = nextModel;
+  if (yoloChanged || modelChanged) restartAgentAndRestore();
+}
+
+$("settings-close").addEventListener("click", () => closeSettings(true));
+
+const MODE_IDS = ["ask", "default", "plan"];
+const MODE_PLACEHOLDER = {
+  ask: "Ask a question — Grok will read and explain, not edit…",
+  default: "Ask Grok to build, fix, or explain something…",
+  plan: "Describe the change — Grok will plan, not apply…",
+};
+
+function normalizeMode(id) {
+  return MODE_IDS.includes(id) ? id : "default";
+}
+
+function applyMode(modeId, { persist = true, notify = true } = {}) {
+  const id = normalizeMode(modeId);
+  if (persist) prefs.mode = id;
+  if (state.activeChat) state.activeChat.modeId = id;
+  for (const btn of document.querySelectorAll("#mode-seg .mode-btn")) {
+    btn.classList.toggle("active", btn.dataset.mode === id);
+  }
+  if (notify) updateComposer();
+}
+
+async function setChatMode(modeId, { persist = true } = {}) {
+  const id = normalizeMode(modeId);
+  applyMode(id, { persist, notify: true });
+  const chat = state.activeChat;
+  if (!chat?.sessionId) return;
+  try {
+    await client.setMode(chat.sessionId, id);
+  } catch (err) {
+    toast(`Couldn't switch mode: ${err.message || err}`);
+  }
+}
+
+$("mode-seg").addEventListener("click", (e) => {
+  const btn = e.target.closest(".mode-btn");
+  if (!btn || !btn.dataset.mode) return;
+  e.stopPropagation();
+  setChatMode(btn.dataset.mode);
 });
+
+async function restartAgentAndRestore() {
+  const active = state.activeChat;
+  const snapshot = active
+    ? {
+        sessionId: active.sessionId,
+        cwd: active.folder,
+        title: active.title,
+        modelId: active.models?.currentModelId,
+      }
+    : null;
+  for (const c of state.chats) {
+    if (c.busy) endTurn(c);
+  }
+  state.restarting = true;
+  toast("Restarting agent…");
+  try {
+    await client.start({ model: prefs.model || null, alwaysApprove: prefs.alwaysApprove });
+    await silentAuth();
+    state.commands = client.availableCommands();
+    for (const c of state.chats) c.el.remove();
+    state.chats = [];
+    state.activeChat = null;
+    $("transcripts").textContent = "";
+    if (snapshot?.sessionId && snapshot.cwd) {
+      await resumeSession({
+        sessionId: snapshot.sessionId,
+        cwd: snapshot.cwd,
+        title: snapshot.title,
+        modelId: snapshot.modelId,
+      });
+    } else if (state.folder) {
+      await newChat();
+    }
+    toast("Agent restarted");
+  } catch (err) {
+    toast(`Couldn't restart the agent: ${err.message || err}`);
+  } finally {
+    state.restarting = false;
+    updateComposer();
+    updateModeSeg();
+  }
+}
+
+function updateModeSeg() {
+  applyMode(state.activeChat?.modeId || prefs.mode, { persist: false, notify: false });
+}
 
 // ============================ FOLDER ============================
 
@@ -427,7 +541,7 @@ async function chooseFolder() {
   if (chat && !chat.busy && chat.el.childElementCount === 0) {
     // Empty chat: rebind it to the new folder instead of leaving a stale cwd.
     try {
-      const session = await client.newSession(picked);
+      const session = await client.newSession(picked, { yoloMode: prefs.alwaysApprove });
       chat.sessionId = session.sessionId;
       chat.folder = picked;
       applySessionInfo(chat, session);
@@ -457,6 +571,9 @@ function updateFolderLabel() {
 function applySessionInfo(chat, session) {
   chat.models = session.models || { currentModelId: null, availableModels: [] };
   updateModelLabel();
+  const modes = session.modes || session.sessionModes || {};
+  const fromSession = modes.currentModeId || modes.current_mode_id;
+  if (fromSession) applyMode(fromSession, { persist: false, notify: false });
   const meta = session._meta || {};
   if (meta.showNonGitWarning || meta.isGitRepo === false) {
     toast("Heads up: this folder isn't a git repository. Grok works best inside a project folder.", 5000);
@@ -483,6 +600,8 @@ function makeChatShell(sessionId, folder, title) {
     usage: emptyUsage(),
     folder,
     lastAt: new Date().toISOString(),
+    toolCards: new Map(),
+    modeId: prefs.mode,
     _userBubble: null,
     _userBuf: "",
   };
@@ -507,7 +626,9 @@ async function newChat() {
 
   let session;
   try {
-    session = await client.newSession(state.folder);
+    session = await client.newSession(state.folder, {
+      yoloMode: prefs.alwaysApprove,
+    });
   } catch (err) {
     toast(`Couldn't start a chat: ${err.message || err}`);
     return;
@@ -517,6 +638,9 @@ async function newChat() {
   applySessionInfo(chat, session);
   state.chats.push(chat);
   switchChat(chat);
+  if (prefs.mode && prefs.mode !== "default") {
+    await setChatMode(prefs.mode, { persist: false });
+  }
 }
 
 // Reopen a stored session: the agent reloads its context and replays the
@@ -552,7 +676,8 @@ async function resumeSession(stored) {
     endTurn(chat);
     renderSidebar();
     updateEmptyState();
-    scrollToBottom();
+    stickToBottom = true;
+    maybeScroll();
   }
 }
 
@@ -580,6 +705,9 @@ function switchChat(chat) {
   updateEmptyState();
   updateModelLabel();
   updateUsageChip();
+  updateModeSeg();
+  stickToBottom = true;
+  maybeScroll();
   $("prompt-input").focus();
 }
 
@@ -694,21 +822,74 @@ function updateEmptyState() {
 
 // ============================ TRANSCRIPT RENDERING ============================
 
-function scrollToBottom() {
-  const box = $("transcripts");
+const SCROLL_LOCK_PX = 80;
+let stickToBottom = true;
+
+function transcriptsEl() {
+  return $("transcripts");
+}
+
+function isNearBottom(el, threshold = SCROLL_LOCK_PX) {
+  return el.scrollHeight - el.scrollTop - el.clientHeight <= threshold;
+}
+
+function updateJumpLatest() {
+  $("jump-latest").classList.toggle("hidden", stickToBottom);
+}
+
+function maybeScroll() {
+  const box = transcriptsEl();
+  if (stickToBottom) {
+    box.scrollTop = box.scrollHeight;
+    updateJumpLatest();
+    return;
+  }
+  if (isNearBottom(box)) {
+    stickToBottom = true;
+    box.scrollTop = box.scrollHeight;
+  }
+  updateJumpLatest();
+}
+
+function jumpToLatest() {
+  stickToBottom = true;
+  const box = transcriptsEl();
   box.scrollTop = box.scrollHeight;
+  updateJumpLatest();
+}
+
+transcriptsEl().addEventListener("scroll", () => {
+  stickToBottom = isNearBottom(transcriptsEl());
+  updateJumpLatest();
+}, { passive: true });
+
+$("jump-latest").addEventListener("click", jumpToLatest);
+
+function addCopyButton(kind, label) {
+  const btn = document.createElement("button");
+  btn.type = "button";
+  btn.className = "copy-btn";
+  btn.dataset.copy = kind;
+  btn.setAttribute("aria-label", label);
+  btn.textContent = "Copy";
+  return btn;
 }
 
 function addUserMessage(chat, text) {
   const wrap = document.createElement("div");
   wrap.className = "msg msg-user";
+  const col = document.createElement("div");
+  col.className = "bubble-wrap";
+  col.appendChild(addCopyButton("user", "Copy message"));
   const bubble = document.createElement("div");
   bubble.className = "bubble";
   bubble.textContent = text;
-  wrap.appendChild(bubble);
+  col.appendChild(bubble);
+  wrap.appendChild(col);
   chat.el.appendChild(wrap);
   updateEmptyState();
-  scrollToBottom();
+  stickToBottom = true;
+  maybeScroll();
 }
 
 function beginTurn(chat, withSpinner = true) {
@@ -731,6 +912,7 @@ function beginTurn(chat, withSpinner = true) {
     spinner,
     hasSpinner: withSpinner,
     mdDiv: null,
+    mdStream: null,
     textBuf: "",
     thoughtEl: null,
     thoughtBody: "",
@@ -789,7 +971,11 @@ function endTurn(chat) {
   scheduleStoredRefresh();
 }
 
-function sealTextBlock(turn) { turn.mdDiv = null; turn.textBuf = ""; }
+function sealTextBlock(turn) {
+  turn.mdDiv = null;
+  turn.mdStream = null;
+  turn.textBuf = "";
+}
 function sealThought(turn) { turn.thoughtEl = null; turn.thoughtBody = ""; }
 
 function contentText(content) {
@@ -799,40 +985,153 @@ function contentText(content) {
   return "";
 }
 
+const TEXT_OUTPUT_CLIP = 80_000;
+
+function clipText(s, n = TEXT_OUTPUT_CLIP) {
+  if (!s) return "";
+  return s.length > n ? s.slice(0, n) + "\n…" : s;
+}
+
+function shortPath(p) {
+  if (!p) return "";
+  const parts = String(p).split(/[\\/]/).filter(Boolean);
+  return parts.slice(-2).join("/") || String(p);
+}
+
+function singleLine(s) {
+  return String(s).replace(/\s+/g, " ").trim();
+}
+
+function truncate(s, n) {
+  const t = String(s);
+  return t.length > n ? `${t.slice(0, n - 1)}…` : t;
+}
+
+const KIND_VERB = {
+  read: "Read",
+  edit: "Edit",
+  delete: "Delete",
+  move: "Move",
+  search: "Search",
+  execute: "Run",
+  think: "Think",
+  fetch: "Fetch",
+  switch_mode: "Switch mode",
+};
+
+function titleCaseKind(kind) {
+  return String(kind || "Tool")
+    .replace(/[_-]+/g, " ")
+    .replace(/\b\w/g, (c) => c.toUpperCase());
+}
+
+function rawField(raw, ...keys) {
+  if (!raw || typeof raw !== "object") return "";
+  for (const k of keys) {
+    const v = raw[k];
+    if (typeof v === "string" && v.trim()) return v;
+  }
+  return "";
+}
+
+function humanToolTitle(update) {
+  const kind = String(update.kind || "").toLowerCase();
+  const verb = KIND_VERB[kind] || titleCaseKind(update.kind || "");
+  const loc = update.locations?.[0]?.path || update.locations?.[0]?.uri;
+  const raw = update.rawInput || update.raw_input || update.input || {};
+  const path = loc || rawField(raw, "path", "file", "target_file", "file_path", "filename", "uri");
+  const cmd = rawField(raw, "command", "cmd", "script");
+  const query = rawField(raw, "query", "pattern", "regex", "search");
+
+  if (cmd) return `${verb || "Run"} ${truncate(singleLine(cmd), 72)}`;
+  if (path) return `${verb || "Read"} ${shortPath(path)}`;
+  if (query) return `${verb || "Search"} ${truncate(singleLine(query), 56)}`;
+
+  const given = (update.title || "").trim();
+  if (given) {
+    if (verb && given.toLowerCase().startsWith(verb.toLowerCase())) return given;
+    // Agent often sends the snake_case tool id as title ("read_file").
+    if (/^[a-z][a-z0-9_]*$/.test(given) && given.includes("_")) {
+      return verb || titleCaseKind(given);
+    }
+    return verb ? `${verb} ${given}` : given;
+  }
+  return verb || "Tool";
+}
+
+function normalizeStatus(status) {
+  if (!status) return "pending";
+  return String(status)
+    .replace(/([a-z0-9])([A-Z])/g, "$1_$2")
+    .replace(/-/g, "_")
+    .toLowerCase();
+}
+
+function renderDiff(body, d) {
+  const oldText = d.oldText ?? d.old_text ?? "";
+  const newText = d.newText ?? d.new_text ?? "";
+  const { lines, added, deleted } = unifiedLineDiff(oldText, newText);
+  const wrap = document.createElement("div");
+  wrap.className = "diff";
+  const path = document.createElement("div");
+  path.className = "diff-path";
+  const file = document.createElement("span");
+  file.className = "diff-file";
+  file.textContent = d.path || "file";
+  const stat = document.createElement("span");
+  stat.className = "diff-stat";
+  const addEl = document.createElement("span");
+  addEl.className = "diff-add";
+  addEl.textContent = `+${added}`;
+  const delEl = document.createElement("span");
+  delEl.className = "diff-del";
+  delEl.textContent = `−${deleted}`;
+  stat.append(addEl, document.createTextNode(" / "), delEl);
+  path.append(file, stat);
+  wrap.appendChild(path);
+  const hunk = document.createElement("div");
+  hunk.className = "diff-hunk";
+  for (const line of lines) {
+    const row = document.createElement("div");
+    row.className = `diff-line ${line.type}`;
+    if (line.type === "skip") {
+      row.textContent = line.text;
+    } else {
+      const g = document.createElement("span");
+      g.className = "diff-gutter";
+      g.textContent = line.type === "add" ? "+" : line.type === "del" ? "−" : " ";
+      const t = document.createElement("span");
+      t.className = "diff-text";
+      t.textContent = line.text;
+      row.append(g, t);
+    }
+    hunk.appendChild(row);
+  }
+  wrap.appendChild(hunk);
+  body.appendChild(wrap);
+}
+
+function renderOutputPre(body, text) {
+  const pre = document.createElement("pre");
+  pre.appendChild(addCopyButton("pre", "Copy output"));
+  const code = document.createElement("code");
+  const clipped = clipText(text);
+  code.textContent = clipped;
+  pre.appendChild(code);
+  body.appendChild(pre);
+}
+
 // Render ToolCallContent items (text output, file diffs) into a card body.
 function renderToolContent(body, items) {
   body.textContent = "";
-  const clip = (s, n = 4000) => (s && s.length > n ? s.slice(0, n) + "\n…" : s || "");
   for (const item of items || []) {
     if (!item || typeof item !== "object") continue;
     if (item.type === "diff" || item.diff) {
-      const d = item.diff || item;
-      const path = document.createElement("div");
-      path.className = "diff-path";
-      path.textContent = d.path || "";
-      body.appendChild(path);
-      if (d.oldText) {
-        const pre = document.createElement("pre");
-        pre.className = "diff-old";
-        const code = document.createElement("code");
-        code.textContent = clip(d.oldText);
-        pre.appendChild(code);
-        body.appendChild(pre);
-      }
-      const pre = document.createElement("pre");
-      pre.className = "diff-new";
-      const code = document.createElement("code");
-      code.textContent = clip(d.newText);
-      pre.appendChild(code);
-      body.appendChild(pre);
+      renderDiff(body, item.diff || item);
     } else {
       const text = contentText(item.content ?? item);
       if (!text) continue;
-      const pre = document.createElement("pre");
-      const code = document.createElement("code");
-      code.textContent = clip(text);
-      pre.appendChild(code);
-      body.appendChild(pre);
+      renderOutputPre(body, text);
     }
   }
 }
@@ -851,6 +1150,13 @@ function handleUpdate(params) {
   // Non-turn notifications we care about.
   if (update.sessionUpdate === "available_commands_update") {
     state.commands = update.availableCommands || [];
+    return;
+  }
+  if (update.sessionUpdate === "current_mode_update") {
+    const modeId = update.currentModeId || update.current_mode_id || update.modeId;
+    const chat = chatBySession(params.sessionId);
+    if (chat) chat.modeId = normalizeMode(modeId);
+    if (chat && chat === state.activeChat) applyMode(modeId, { persist: true, notify: true });
     return;
   }
 
@@ -877,17 +1183,32 @@ function handleUpdate(params) {
     } else {
       const wrap = document.createElement("div");
       wrap.className = "msg msg-user";
+      const col = document.createElement("div");
+      col.className = "bubble-wrap";
+      col.appendChild(addCopyButton("user", "Copy message"));
       const bubble = document.createElement("div");
       bubble.className = "bubble";
       bubble.textContent = text;
-      wrap.appendChild(bubble);
+      col.appendChild(bubble);
+      wrap.appendChild(col);
       chat.el.appendChild(wrap);
       chat._userBubble = bubble;
       chat._userBuf = text;
     }
     updateEmptyState();
-    scrollToBottom();
+    maybeScroll();
     return;
+  }
+
+  // Late tool_call_update after endTurn must still land on the existing card.
+  if (update.sessionUpdate === "tool_call_update") {
+    const existing = chat.toolCards.get(update.toolCallId);
+    if (existing) {
+      applyToolCardUpdate(existing, update);
+      if (chat.turn) bumpActivity(chat);
+      maybeScroll();
+      return;
+    }
   }
 
   if (!TURN_CONTENT.has(update.sessionUpdate)) return;
@@ -908,9 +1229,10 @@ function handleUpdate(params) {
         turn.mdDiv = document.createElement("div");
         turn.mdDiv.className = "md";
         turn.container.insertBefore(turn.mdDiv, turn.spinner);
+        turn.mdStream = createMdStream();
       }
       turn.textBuf += contentText(update.content);
-      turn.mdDiv.innerHTML = renderMarkdown(turn.textBuf);
+      updateMdStream(turn.mdDiv, turn.mdStream, turn.textBuf);
       break;
     }
     case "agent_thought_chunk": {
@@ -929,54 +1251,21 @@ function handleUpdate(params) {
     case "tool_call": {
       sealTextBlock(turn);
       sealThought(turn);
-      const card = document.createElement("details");
-      card.className = "tool-call";
-      const summary = document.createElement("summary");
-      const status = document.createElement("span");
-      status.className = `tool-status ${update.status || "pending"}`;
-      const title = document.createElement("span");
-      title.className = "tool-title";
-      const kind = document.createElement("span");
-      kind.className = "tool-kind";
-      kind.textContent = update.kind || "tool";
-      title.appendChild(kind);
-      title.appendChild(document.createTextNode(update.title || ""));
-      const caret = document.createElement("span");
-      caret.className = "tool-caret hidden";
-      caret.textContent = "▶";
-      summary.appendChild(status);
-      summary.appendChild(title);
-      summary.appendChild(caret);
-      card.appendChild(summary);
-      const body = document.createElement("div");
-      body.className = "tool-body hidden";
-      card.appendChild(body);
-      turn.container.insertBefore(card, turn.spinner);
-
-      const entry = { statusEl: status, titleEl: title, kindEl: kind, body, caret };
+      const entry = createToolCard(chat, turn, update);
       if (update.content?.length) {
-        renderToolContent(body, update.content);
-        body.classList.remove("hidden");
-        caret.classList.remove("hidden");
+        renderToolContent(entry.body, update.content);
+        entry.body.classList.remove("hidden");
+        entry.caret.classList.remove("hidden");
       }
-      if (update.toolCallId) turn.toolCards.set(update.toolCallId, entry);
       break;
     }
     case "tool_call_update": {
-      const card = turn.toolCards.get(update.toolCallId);
-      if (card) {
-        if (update.status) card.statusEl.className = `tool-status ${update.status}`;
-        if (update.title) {
-          card.titleEl.textContent = "";
-          card.titleEl.appendChild(card.kindEl);
-          card.titleEl.appendChild(document.createTextNode(update.title));
-        }
-        if (update.content?.length) {
-          renderToolContent(card.body, update.content);
-          card.body.classList.remove("hidden");
-          card.caret.classList.remove("hidden");
-        }
+      let card = turn.toolCards.get(update.toolCallId) || chat.toolCards.get(update.toolCallId);
+      if (!card) {
+        // Update arrived before the start notification — synthesize a card.
+        card = createToolCard(chat, turn, update);
       }
+      applyToolCardUpdate(card, update);
       break;
     }
     case "plan": {
@@ -1005,7 +1294,49 @@ function handleUpdate(params) {
     default:
       break;
   }
-  scrollToBottom();
+  maybeScroll();
+}
+
+function createToolCard(chat, turn, update) {
+  const card = document.createElement("details");
+  card.className = "tool-call";
+  const summary = document.createElement("summary");
+  const status = document.createElement("span");
+  status.className = `tool-status ${normalizeStatus(update.status)}`;
+  const title = document.createElement("span");
+  title.className = "tool-title";
+  title.textContent = humanToolTitle(update);
+  const caret = document.createElement("span");
+  caret.className = "tool-caret hidden";
+  caret.textContent = "▶";
+  summary.appendChild(status);
+  summary.appendChild(title);
+  summary.appendChild(caret);
+  card.appendChild(summary);
+  const body = document.createElement("div");
+  body.className = "tool-body hidden";
+  card.appendChild(body);
+  turn.container.insertBefore(card, turn.spinner);
+  const entry = { statusEl: status, titleEl: title, body, caret, update };
+  if (update.toolCallId) {
+    turn.toolCards.set(update.toolCallId, entry);
+    chat.toolCards.set(update.toolCallId, entry);
+  }
+  return entry;
+}
+
+function applyToolCardUpdate(card, update) {
+  if (update.status) card.statusEl.className = `tool-status ${normalizeStatus(update.status)}`;
+  const merged = { ...(card.update || {}), ...update };
+  if (update.rawInput || update.raw_input || update.input || update.locations || update.kind || update.title) {
+    card.update = merged;
+    card.titleEl.textContent = humanToolTitle(merged);
+  }
+  if (update.content?.length) {
+    renderToolContent(card.body, update.content);
+    card.body.classList.remove("hidden");
+    card.caret.classList.remove("hidden");
+  }
 }
 
 client.onSessionUpdate = handleUpdate;
@@ -1080,7 +1411,7 @@ function appendErrorNote(chat, msg) {
   note.className = "error-note";
   note.textContent = msg;
   (chat.turn?.container || chat.el).appendChild(note);
-  scrollToBottom();
+  maybeScroll();
 }
 
 // ============================ PERMISSIONS ============================
@@ -1090,59 +1421,206 @@ function appendErrorNote(chat, msg) {
 // overwrite the first's dialog and orphan its promise — the agent then waits
 // on the unanswered request forever and the whole session looks hung.
 let permQueue = Promise.resolve();
+let permPending = 0;
+let permDeny = null;
+
+const ENABLE_ALWAYS_APPROVE_ID = "enable-always-approve";
+
 client.onPermissionRequest = (params) => {
+  permPending++;
+  updatePermWaiting();
   const turn = permQueue.then(() => showPermissionModal(params));
-  permQueue = turn.then(() => {}, () => {});
+  permQueue = turn.then(
+    () => { permPending--; updatePermWaiting(); },
+    () => { permPending--; updatePermWaiting(); }
+  );
   return turn;
 };
+
+function updatePermWaiting() {
+  const el = $("perm-waiting");
+  const extra = Math.max(0, permPending - 1);
+  el.classList.toggle("hidden", extra === 0);
+  el.textContent = extra === 1 ? "1 more waiting" : `${extra} more waiting`;
+}
+
+function pickRaw(raw, ...keys) {
+  if (!raw || typeof raw !== "object") return "";
+  for (const k of keys) {
+    const v = raw[k];
+    if (v == null || v === "") continue;
+    if (typeof v === "string") return v;
+    if (typeof v === "number" || typeof v === "boolean") return String(v);
+  }
+  return "";
+}
+
+function addPermField(parent, label, value, { pre = false, cls = "" } = {}) {
+  if (!value) return;
+  const field = document.createElement("div");
+  field.className = "perm-field";
+  const k = document.createElement("div");
+  k.className = "perm-k";
+  k.textContent = label;
+  field.appendChild(k);
+  if (pre) {
+    const block = document.createElement("pre");
+    const code = document.createElement("code");
+    const text = String(value);
+    code.textContent = text.length > 80_000 ? text.slice(0, 80_000) + "\n…" : text;
+    block.appendChild(code);
+    field.appendChild(block);
+  } else {
+    const v = document.createElement("div");
+    v.className = "perm-v" + (cls ? ` ${cls}` : "");
+    v.textContent = value;
+    field.appendChild(v);
+  }
+  parent.appendChild(field);
+}
+
+function renderPermissionReview(body, tool) {
+  body.textContent = "";
+  const raw = tool.rawInput ?? tool.raw_input ?? tool.input ?? {};
+  const loc = tool.locations?.[0]?.path || tool.locations?.[0]?.uri || "";
+  const command = pickRaw(raw, "command", "cmd", "script");
+  const path = loc || pickRaw(raw, "path", "target_file", "file_path", "file", "filename");
+  const contents = pickRaw(raw, "contents", "content", "new_string", "new_text", "text");
+  const oldText = pickRaw(raw, "old_string", "old_text");
+  const query = pickRaw(raw, "query", "pattern", "regex", "search");
+  const url = pickRaw(raw, "url", "uri");
+  const known = new Set([
+    "command", "cmd", "script", "path", "target_file", "file_path", "file", "filename",
+    "contents", "content", "new_string", "new_text", "text", "old_string", "old_text",
+    "query", "pattern", "regex", "search", "url", "uri",
+  ]);
+
+  if (command) addPermField(body, "Command", command, { pre: true, cls: "cmd" });
+  if (path) addPermField(body, "Path", path);
+  if (url && url !== path) addPermField(body, "URL", url);
+  if (query) addPermField(body, "Search", query);
+  if (oldText) addPermField(body, "Replace", oldText, { pre: true });
+  if (contents) addPermField(body, command ? "Input" : "Contents", contents, { pre: true });
+
+  if (raw && typeof raw === "object" && !Array.isArray(raw)) {
+    for (const [k, v] of Object.entries(raw)) {
+      if (known.has(k) || v == null || v === "") continue;
+      if (typeof v === "object") continue;
+      addPermField(body, k.replace(/_/g, " "), String(v));
+    }
+  }
+
+  if (!body.childElementCount && raw !== undefined) {
+    addPermField(
+      body,
+      "Details",
+      typeof raw === "string" ? raw : JSON.stringify(raw, null, 2),
+      { pre: true }
+    );
+  }
+}
+
+function classifyPermOption(opt) {
+  const id = String(opt.optionId || opt.option_id || "");
+  const kind = String(opt.kind || "").toLowerCase();
+  if (id === ENABLE_ALWAYS_APPROVE_ID) return "always";
+  if (id === "allow-edits-session" || id === "always-allow" || id.startsWith("allow-always")) return "always";
+  if (kind === "allowalways" || kind === "allow_always") return "always";
+  if (kind === "allowonce" || kind === "allow_once" || id === "allow-once") return "allow";
+  if (kind === "rejectonce" || kind === "reject_once" || id === "reject-once") return "deny";
+  if (/reject|deny|cancel/.test(kind) || /reject|deny|cancel/.test(id)) return "deny";
+  if (/allow/.test(kind) || /allow/.test(id)) return "allow";
+  return "other";
+}
 
 const showPermissionModal = (params) =>
   new Promise((resolve) => {
     const overlay = $("perm-overlay");
     const body = $("perm-body");
     const optionsBox = $("perm-options");
-    body.textContent = "";
-    optionsBox.textContent = "";
-
-    const tool = params.toolCall || {};
+    const tool = params.toolCall || params.tool_call || {};
     $("perm-title").textContent = tool.title || "Grok wants to run an action";
+    renderPermissionReview(body, tool);
+    optionsBox.textContent = "";
+    updatePermWaiting();
 
-    const rawInput = tool.rawInput ?? tool.input;
-    if (rawInput !== undefined) {
-      const pre = document.createElement("pre");
-      const code = document.createElement("code");
-      try {
-        code.textContent = typeof rawInput === "string" ? rawInput : JSON.stringify(rawInput, null, 2);
-      } catch {
-        code.textContent = String(rawInput);
-      }
-      pre.appendChild(code);
-      body.appendChild(pre);
-    }
+    const options = params.options || [];
+    const pick = (role) => options.find((o) => classifyPermOption(o) === role);
 
     const finish = (outcome) => {
+      permDeny = null;
       overlay.classList.add("hidden");
       resolve(outcome);
     };
 
-    for (const opt of params.options || []) {
+    const deny = () => {
+      const opt = pick("deny");
+      if (opt) finish({ outcome: "selected", optionId: opt.optionId || opt.option_id });
+      else finish({ outcome: "cancelled" });
+    };
+    permDeny = deny;
+
+    const addBtn = (label, cls, onClick) => {
       const btn = document.createElement("button");
-      const isAllow = /allow/.test(opt.kind || "");
-      btn.className = isAllow ? "btn btn-primary" : "btn";
-      btn.textContent = opt.name || opt.optionId;
-      btn.addEventListener("click", () => finish({ outcome: "selected", optionId: opt.optionId }));
+      btn.className = cls;
+      btn.textContent = label;
+      btn.addEventListener("click", onClick);
       optionsBox.appendChild(btn);
+    };
+
+    const allow = pick("allow") || options.find((o) => /allow/i.test(o.kind || o.name || ""));
+    const always = pick("always");
+
+    if (allow) {
+      addBtn("Allow", "btn btn-primary", () => {
+        finish({ outcome: "selected", optionId: allow.optionId || allow.option_id });
+      });
     }
-    if (!(params.options || []).length) {
-      const btn = document.createElement("button");
-      btn.className = "btn";
-      btn.textContent = "Cancel";
-      btn.addEventListener("click", () => finish({ outcome: "cancelled" }));
-      optionsBox.appendChild(btn);
-    }
+    addBtn("Allow always", "btn", () => {
+      if (always) {
+        const id = always.optionId || always.option_id;
+        if (id === ENABLE_ALWAYS_APPROVE_ID) {
+          prefs.alwaysApprove = true;
+          client.yoloModeChanged({ yoloMode: true, permissionMode: "always-approve" });
+        }
+        finish({ outcome: "selected", optionId: id });
+        return;
+      }
+      prefs.alwaysApprove = true;
+      client.yoloModeChanged({ yoloMode: true, permissionMode: "always-approve" });
+      if (allow) finish({ outcome: "selected", optionId: allow.optionId || allow.option_id });
+      else finish({ outcome: "cancelled" });
+    });
+    addBtn("Deny", "btn", deny);
 
     overlay.classList.remove("hidden");
   });
+
+$("perm-overlay").addEventListener("click", (e) => {
+  if (e.target === $("perm-overlay") && permDeny) permDeny();
+});
+
+document.addEventListener("keydown", (e) => {
+  if (e.key !== "Escape") return;
+  if (!$("perm-overlay").classList.contains("hidden") && permDeny) {
+    e.preventDefault();
+    permDeny();
+    return;
+  }
+  if (!$("settings-overlay").classList.contains("hidden")) {
+    e.preventDefault();
+    closeSettings(false);
+    return;
+  }
+  if (!$("usage-overlay").classList.contains("hidden")) {
+    e.preventDefault();
+    $("usage-overlay").classList.add("hidden");
+  }
+});
+
+$("settings-overlay").addEventListener("click", (e) => {
+  if (e.target === $("settings-overlay")) closeSettings(false);
+});
 
 // ============================ USAGE ============================
 
@@ -1508,9 +1986,10 @@ function updateComposer() {
   $("stop-btn").classList.toggle("hidden", !busy);
   const input = $("prompt-input");
   input.disabled = gated;
+  const mode = state.activeChat?.modeId || prefs.mode;
   input.placeholder = gated
     ? "Open a project folder to start…"
-    : "Ask Grok to build, fix, or explain something…";
+    : MODE_PLACEHOLDER[mode] || MODE_PLACEHOLDER.default;
   $("composer-inner").classList.toggle("disabled", gated);
   $("send-btn").disabled = gated;
 }
@@ -1537,7 +2016,9 @@ async function sendPrompt() {
   updateComposer();
 
   try {
-    const result = await client.prompt(chat.sessionId, text);
+    const result = await client.prompt(chat.sessionId, text, {
+      mode: chat.modeId || prefs.mode,
+    });
     addUsage(chat, result?._meta?.usage);
   } catch (err) {
     const note = document.createElement("div");
@@ -1546,7 +2027,7 @@ async function sendPrompt() {
     (chat.turn?.container || chat.el).appendChild(note);
   } finally {
     endTurn(chat);
-    scrollToBottom();
+    maybeScroll();
   }
 }
 
@@ -1605,7 +2086,18 @@ $("prompt-input").addEventListener("input", (e) => {
 
 // ============================ AGENT LIFECYCLE ============================
 
+client.onYoloModeChanged = (params) => {
+  const yolo = params.yolo_mode ?? params.yoloMode;
+  if (typeof yolo === "boolean") {
+    prefs.alwaysApprove = yolo;
+    if (!$("settings-overlay").classList.contains("hidden")) {
+      $("set-yolo").checked = yolo;
+    }
+  }
+};
+
 client.onExit = () => {
+  if (state.restarting) return;
   for (const chat of state.chats) if (chat.busy) endTurn(chat);
   const active = state.activeChat;
   if (active) {
@@ -1616,7 +2108,7 @@ client.onExit = () => {
       (state.stderrTail.length ? `\n\n${state.stderrTail.join("\n")}` : "") +
       "\n\nReopen the app to reconnect.";
     active.el.appendChild(note);
-    scrollToBottom();
+    maybeScroll();
   }
   toast("Agent stopped");
 };
@@ -1627,12 +2119,67 @@ client.onStderr = (line) => {
 };
 
 // External links from markdown open in the system browser.
+// Copy buttons on <pre> and user bubbles use the same delegation.
 document.addEventListener("click", (e) => {
   const a = e.target.closest("a[data-external]");
   if (a) {
     e.preventDefault();
     openExternal(a.getAttribute("href")).catch(() => {});
+    return;
+  }
+  const btn = e.target.closest("[data-copy]");
+  if (btn) {
+    e.preventDefault();
+    e.stopPropagation();
+    copyFromButton(btn);
   }
 });
+
+async function copyText(text) {
+  if (!text) return false;
+  try {
+    if (navigator.clipboard?.writeText) {
+      await navigator.clipboard.writeText(text);
+      return true;
+    }
+  } catch {
+    /* fall through */
+  }
+  try {
+    const ta = document.createElement("textarea");
+    ta.value = text;
+    ta.setAttribute("readonly", "");
+    ta.style.position = "fixed";
+    ta.style.left = "-9999px";
+    document.body.appendChild(ta);
+    ta.select();
+    const ok = document.execCommand("copy");
+    ta.remove();
+    return ok;
+  } catch {
+    return false;
+  }
+}
+
+function copyFromButton(btn) {
+  let text = "";
+  if (btn.dataset.copy === "user") {
+    text = btn.closest(".bubble-wrap")?.querySelector(".bubble")?.textContent || "";
+  } else {
+    const pre = btn.closest("pre");
+    text = pre?.querySelector("code")?.textContent ?? pre?.textContent ?? "";
+  }
+  copyText(text).then((ok) => {
+    if (!ok) return;
+    const prev = btn.textContent;
+    btn.textContent = "Copied";
+    btn.classList.add("copied");
+    clearTimeout(btn._copiedT);
+    btn._copiedT = setTimeout(() => {
+      btn.textContent = prev;
+      btn.classList.remove("copied");
+    }, 1200);
+  });
+}
 
 boot();
