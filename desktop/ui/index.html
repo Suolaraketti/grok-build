@@ -124,37 +124,51 @@
         <div id="model-menu" class="menu-pop hidden"></div>
       </header>
 
-      <section id="chat-area" class="panel">
-        <div id="transcripts"></div>
+      <div id="workspace">
+        <section id="chat-area" class="panel">
+          <div id="transcripts"></div>
 
-        <div id="empty-state" class="empty-state">
-          <div class="brand-mark xl">/</div>
-          <h2>What are we building?</h2>
-          <p class="muted">Grok reads your code, edits files, and runs commands — with your approval.</p>
-          <div id="empty-folder-cta" class="empty-cta hidden">
-            <button id="empty-open-folder" class="btn btn-primary">Open a project folder</button>
-            <p class="muted small">Pick the project you want Grok to work in.</p>
-          </div>
-          <div id="empty-suggestions" class="suggestions"></div>
-        </div>
-
-        <div id="composer">
-          <div id="slash-menu" class="slash-menu hidden"></div>
-          <div id="composer-inner">
-            <textarea id="prompt-input" rows="1"
-              placeholder="Ask Grok to build, fix, or explain something…"></textarea>
-            <div class="composer-actions">
-              <button id="send-btn" class="iconbtn iconbtn-send" title="Send (Enter)" aria-label="Send">
-                <svg viewBox="0 0 16 16" width="16" height="16"><path fill="currentColor" d="M8 14a.75.75 0 0 1-.75-.75V4.56L4.03 7.78a.75.75 0 0 1-1.06-1.06l4.5-4.5a.75.75 0 0 1 1.06 0l4.5 4.5a.75.75 0 1 1-1.06 1.06L8.75 4.56v8.69A.75.75 0 0 1 8 14Z"/></svg>
-              </button>
-              <button id="stop-btn" class="iconbtn iconbtn-stop hidden" title="Stop" aria-label="Stop">
-                <svg viewBox="0 0 16 16" width="14" height="14"><rect x="3" y="3" width="10" height="10" rx="2" fill="currentColor"/></svg>
-              </button>
+          <div id="empty-state" class="empty-state">
+            <div class="brand-mark xl">/</div>
+            <h2>What are we building?</h2>
+            <p class="muted">Grok reads your code, edits files, and runs commands — with your approval.</p>
+            <div id="empty-folder-cta" class="empty-cta hidden">
+              <button id="empty-open-folder" class="btn btn-primary">Open a project folder</button>
+              <p class="muted small">Pick the project you want Grok to work in.</p>
             </div>
+            <div id="empty-suggestions" class="suggestions"></div>
           </div>
-          <div id="composer-hint" class="muted small">Enter to send · Shift+Enter for a new line</div>
-        </div>
-      </section>
+
+          <button id="jump-latest" class="jump-latest hidden" type="button">Latest ↓</button>
+
+          <div id="composer">
+            <div id="slash-menu" class="slash-menu hidden"></div>
+            <div id="composer-inner">
+              <div id="composer-toolbar" class="composer-toolbar">
+                <div id="mode-seg" class="mode-seg" role="tablist" aria-label="Agent mode">
+                  <button type="button" class="mode-btn" data-mode="ask">Ask</button>
+                  <button type="button" class="mode-btn active" data-mode="default">Agent</button>
+                  <button type="button" class="mode-btn" data-mode="plan">Plan</button>
+                </div>
+              </div>
+              <div class="composer-row">
+                <textarea id="prompt-input" rows="1"
+                  placeholder="Ask Grok to build, fix, or explain something…"></textarea>
+                <div class="composer-actions">
+                  <button id="send-btn" class="iconbtn iconbtn-send" title="Send (Enter)" aria-label="Send">
+                    <svg viewBox="0 0 16 16" width="16" height="16"><path fill="currentColor" d="M8 14a.75.75 0 0 1-.75-.75V4.56L4.03 7.78a.75.75 0 0 1-1.06-1.06l4.5-4.5a.75.75 0 0 1 1.06 0l4.5 4.5a.75.75 0 1 1-1.06 1.06L8.75 4.56v8.69A.75.75 0 0 1 8 14Z"/></svg>
+                  </button>
+                  <button id="stop-btn" class="iconbtn iconbtn-stop hidden" title="Stop" aria-label="Stop">
+                    <svg viewBox="0 0 16 16" width="14" height="14"><rect x="3" y="3" width="10" height="10" rx="2" fill="currentColor"/></svg>
+                  </button>
+                </div>
+              </div>
+            </div>
+            <div id="composer-hint" class="muted small">Enter to send · Shift+Enter for a new line</div>
+          </div>
+        </section>
+        <aside id="right-rail" class="hidden" hidden aria-label="Inspector"></aside>
+      </div>
     </main>
   </div>
 
@@ -162,7 +176,10 @@
   <div id="perm-overlay" class="overlay hidden" role="dialog" aria-modal="true">
     <div class="modal">
       <div class="modal-head">
-        <span class="modal-badge">Permission</span>
+        <div class="perm-head-row">
+          <span class="modal-badge">Permission</span>
+          <span id="perm-waiting" class="perm-waiting hidden"></span>
+        </div>
         <h2 id="perm-title">Grok wants to run an action</h2>
       </div>
       <div id="perm-body"></div>
@@ -184,7 +201,7 @@
         <span>Default model <span class="muted">(optional)</span></span>
         <input id="set-model" type="text" placeholder="e.g. grok-build" spellcheck="false" />
       </label>
-      <p class="muted small">Changes to the model or auto-approve take effect on the next new chat.</p>
+      <p class="muted small">Changing the model or auto-approve restarts the agent and restores this chat.</p>
       <div class="perm-options">
         <button id="settings-close" class="btn btn-primary">Done</button>
       </div>
