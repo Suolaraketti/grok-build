@@ -27,7 +27,7 @@ Grok Build itself is a beta for **SuperGrok** and **X Premium+** (or an xAI
 API key). A free grok.com account can sign in, then the API returns 403
 ("coming soon" / no access) until the account is eligible.
 
-Desktop **1.3.0** is the chat GUI over official grok **1.0.5**. It covers the
+Desktop **1.4.0** is the chat GUI over official grok **1.0.5**. It covers the
 TUI surfaces that have ACP hooks:
 
 - Chat: attach images/files, mid-turn steer, prompt history, Ask/Agent/Plan
@@ -36,9 +36,8 @@ TUI surfaces that have ACP hooks:
 - Inspector: session info, context window, running subagents, worktrees, plan
 - Ctrl+K command palette, theme (system/dark/light), docs link
 
-Not ported (TUI-only chrome): mermaid, voice, vim keys, marketplace install UI,
-worktree create, import-from-Claude, live dashboard peek/pin. Those still work
-in the terminal.
+Not ported (TUI-only chrome): mermaid, voice, vim keys, worktree create,
+import-from-Claude, live dashboard peek/pin. Those still work in the terminal.
 
 ## How it works
 
