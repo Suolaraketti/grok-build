@@ -26,3 +26,9 @@ test("empty-state overlay fills the transcript pane only", () => {
   assert.match(css, /\.empty-state\s*\{[^}]*inset:\s*0;/s);
   assert.doesNotMatch(css, /inset:\s*0\s+0\s+118px/);
 });
+
+test("desktop initialize does not advertise waitlisted grok-desktop product", () => {
+  const acp = readFileSync(join(dir, "acp.js"), "utf8");
+  assert.match(acp, /clientIdentifier:\s*CLIENT_IDENTIFIER/);
+  assert.doesNotMatch(acp, /clientIdentifier:\s*"grok-desktop"/);
+});

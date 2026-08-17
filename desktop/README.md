@@ -23,6 +23,10 @@ The app signs you in **without ever touching a terminal**, using the agent's
 Credentials live in `~/.grok`, shared with the CLI. Sign out from the account
 menu in the sidebar.
 
+Grok Build itself is a beta for **SuperGrok** and **X Premium+** (or an xAI
+API key). A free grok.com account can sign in, then the API returns 403
+("coming soon" / no access) until the account is eligible.
+
 ## How it works
 
 The app does **not** reimplement the agent. It is a thin
