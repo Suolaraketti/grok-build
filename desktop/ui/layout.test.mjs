@@ -34,6 +34,7 @@ test("1.3.0 studio and inspector chrome exists", () => {
   assert.match(html, /id="inspector-body"/);
   assert.match(html, /id="set-theme"/);
   assert.match(html, /data-tab="mcp"/);
+  assert.match(html, /data-tab="market"/);
 });
 
 test("1.2.0 chrome for attach, palette, effort, and rewind exists", () => {

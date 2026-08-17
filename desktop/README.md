@@ -32,7 +32,7 @@ TUI surfaces that have ACP hooks:
 
 - Chat: attach images/files, mid-turn steer, prompt history, Ask/Agent/Plan
 - Session: rewind, compact, fork, rename/delete, export, effort, auto-approve
-- Extensions studio: skills, MCP, plugins, hooks (enable/disable)
+- Extensions studio: skills, MCP, plugins, hooks, and the marketplace (add sources, browse, install/update/uninstall)
 - Inspector: session info, context window, running subagents, worktrees, plan
 - Ctrl+K command palette, theme (system/dark/light), docs link
 

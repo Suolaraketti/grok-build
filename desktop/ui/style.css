@@ -488,6 +488,13 @@ input:focus, textarea:focus {
   padding: 10px 0; border-bottom: 1px solid var(--border);
 }
 .studio-name { font-weight: 600; }
+.market-bar { display: flex; gap: 8px; margin-bottom: 10px; align-items: center; }
+.market-bar input[type="search"] {
+  flex: 1; background: var(--bg-2); border: 1px solid var(--border);
+  color: var(--text); border-radius: var(--radius-sm); padding: 8px 10px; font: inherit;
+}
+.market-source { display: flex; flex-wrap: wrap; gap: 6px 12px; align-items: baseline; margin: 14px 0 6px; }
+.market-actions { display: flex; gap: 6px; flex: none; }
 
 #topbar {
   display: flex;

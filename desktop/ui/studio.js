@@ -224,6 +224,7 @@ async function loadStudio() {
     else if (studioTab === "mcp") await renderMcp(body);
     else if (studioTab === "plugins") await renderPlugins(body);
     else if (studioTab === "hooks") await renderHooks(body);
+    else if (studioTab === "market") await renderMarketplace(body);
   } catch (err) {
     body.textContent = "";
     body.appendChild(h("p", "muted", ctx.friendlyRpcError(err)));
@@ -360,4 +361,207 @@ async function renderHooks(body) {
       } : null, enabled)
     );
   }
+}
+
+function marketStatus(plugin) {
+  return String(plugin.installStatus || plugin.install_status || "not_installed").toLowerCase();
+}
+
+function isInstalled(status) {
+  return status === "installed" || status === "update" || status === "outdated" || status === "update_available";
+}
+
+async function runMarket(action, okMsg) {
+  const sid = ctx.getState().activeChat?.sessionId;
+  const needsSession = action.type === "install" || action.type === "update" || action.type === "uninstall";
+  if (needsSession && !sid) {
+    ctx.toast("Open a chat first — install goes through the live agent session.");
+    return;
+  }
+  try {
+    const out = await ctx.client.marketplaceAction(sid || "00000000-0000-0000-0000-000000000000", action);
+    const msg = out.message || okMsg;
+    ctx.toast(msg || okMsg);
+    await loadStudio();
+  } catch (err) {
+    ctx.toast(ctx.friendlyRpcError(err));
+  }
+}
+
+async function renderMarketplace(body) {
+  body.textContent = "";
+  body.appendChild(h("p", "muted small", "Loading marketplace catalogs…"));
+  const data = await ctx.client.marketplaceList();
+  const sources = data.sources || [];
+  body.textContent = "";
+
+  const bar = document.createElement("div");
+  bar.className = "market-bar";
+  const search = document.createElement("input");
+  search.type = "search";
+  search.placeholder = "Filter plugins…";
+  const add = document.createElement("button");
+  add.type = "button";
+  add.className = "btn";
+  add.textContent = "Add source";
+  add.addEventListener("click", async () => {
+    const url = await ctx.askText({
+      title: "Add marketplace",
+      badge: "Marketplace",
+      label: "GitHub owner/repo, a git URL, or a local folder. Nothing installs until you pick a plugin.",
+      value: "",
+      ok: "Add",
+    });
+    if (!url || !url.trim()) return;
+    await runMarket({ type: "add_source", url: url.trim() }, "Source added");
+  });
+  const refresh = document.createElement("button");
+  refresh.type = "button";
+  refresh.className = "btn";
+  refresh.textContent = "Refresh";
+  refresh.addEventListener("click", () => runMarket({ type: "refresh", source_url_or_path: null }, "Refreshed"));
+  bar.appendChild(search);
+  bar.appendChild(add);
+  bar.appendChild(refresh);
+  body.appendChild(bar);
+  body.appendChild(h("p", "muted small", "Same catalogs as /marketplace in the TUI. Add a source, then install plugins you trust."));
+
+  if (!sources.length) {
+    body.appendChild(h("p", "muted", "No marketplace sources yet. Add owner/repo (for example an org/plugins repo) or a git URL."));
+    return;
+  }
+
+  const list = document.createElement("div");
+  body.appendChild(list);
+
+  const paint = () => {
+    const q = search.value.trim().toLowerCase();
+    list.textContent = "";
+    for (const src of sources) {
+      const srcName = src.sourceName || src.source_name || "Source";
+      const srcUrl = src.sourceUrlOrPath || src.source_url_or_path || "";
+      const err = src.error;
+      const head = document.createElement("div");
+      head.className = "market-source";
+      const title = document.createElement("div");
+      title.className = "studio-name";
+      title.textContent = srcName;
+      const meta = document.createElement("div");
+      meta.className = "muted small";
+      meta.textContent = srcUrl || src.sourceKind || src.source_kind || "";
+      const rm = document.createElement("button");
+      rm.type = "button";
+      rm.className = "btn";
+      rm.textContent = "Remove source";
+      rm.addEventListener("click", async () => {
+        const okRm = await ctx.askConfirm({
+          title: "Remove marketplace source?",
+          badge: "Marketplace",
+          body: `Remove “${srcName}”? Installed plugins stay until you uninstall them.`,
+          ok: "Remove",
+        });
+        if (!okRm) return;
+        await runMarket({ type: "remove_source", source_url_or_path: srcUrl }, "Source removed");
+      });
+      head.appendChild(title);
+      head.appendChild(meta);
+      head.appendChild(rm);
+      list.appendChild(head);
+      if (err) {
+        list.appendChild(h("p", "muted small", err));
+        continue;
+      }
+      const plugins = src.plugins || [];
+      const shown = plugins.filter((p) => {
+        if (!q) return true;
+        const blob = [p.name, p.description, p.author, p.category, ...(p.tags || []), ...(p.keywords || [])]
+          .join(" ")
+          .toLowerCase();
+        return blob.includes(q);
+      });
+      if (!shown.length) {
+        list.appendChild(h("p", "muted small", q ? "No plugins match this filter." : "No plugins in this source."));
+        continue;
+      }
+      for (const p of shown) {
+        const status = marketStatus(p);
+        const installed = isInstalled(status);
+        const bits = [
+          p.version && `v${p.version}`,
+          p.author,
+          p.category,
+          p.skillCount || p.skill_count ? `${p.skillCount || p.skill_count} skills` : "",
+          p.hasHooks || p.has_hooks ? "hooks" : "",
+          p.hasMcp || p.has_mcp ? "MCP" : "",
+          status.replace(/_/g, " "),
+        ].filter(Boolean);
+        const el = document.createElement("div");
+        el.className = "studio-row";
+        const left = document.createElement("div");
+        left.appendChild(h("div", "studio-name", p.name));
+        if (p.description) left.appendChild(h("div", "muted small", p.description));
+        left.appendChild(h("div", "muted small", bits.join(" · ")));
+        el.appendChild(left);
+        const actions = document.createElement("div");
+        actions.className = "market-actions";
+        const rel = p.relativePath || p.relative_path;
+        if (!installed) {
+          const inst = document.createElement("button");
+          inst.type = "button";
+          inst.className = "btn btn-primary";
+          inst.textContent = "Install";
+          inst.addEventListener("click", async () => {
+            const okIn = await ctx.askConfirm({
+              title: `Install ${p.name}?`,
+              badge: "Marketplace",
+              body: "Only install plugins you trust. Hooks and MCP servers stay inactive until the plugin is trusted.",
+              ok: "Install",
+            });
+            if (!okIn) return;
+            await runMarket(
+              { type: "install", source_url_or_path: srcUrl, plugin_relative_path: rel },
+              `Installed ${p.name}`
+            );
+          });
+          actions.appendChild(inst);
+        } else {
+          if (status.includes("update") || status === "outdated") {
+            const upd = document.createElement("button");
+            upd.type = "button";
+            upd.className = "btn btn-primary";
+            upd.textContent = "Update";
+            upd.addEventListener("click", () =>
+              runMarket(
+                { type: "update", source_url_or_path: srcUrl, plugin_relative_path: rel },
+                `Updated ${p.name}`
+              )
+            );
+            actions.appendChild(upd);
+          }
+          const un = document.createElement("button");
+          un.type = "button";
+          un.className = "btn";
+          un.textContent = "Uninstall";
+          un.addEventListener("click", async () => {
+            const okUn = await ctx.askConfirm({
+              title: `Uninstall ${p.name}?`,
+              badge: "Marketplace",
+              body: "This removes the plugin from this machine.",
+              ok: "Uninstall",
+            });
+            if (!okUn) return;
+            await runMarket(
+              { type: "uninstall", source_url_or_path: srcUrl, plugin_relative_path: rel },
+              `Uninstalled ${p.name}`
+            );
+          });
+          actions.appendChild(un);
+        }
+        el.appendChild(actions);
+        list.appendChild(el);
+      }
+    }
+  };
+  search.addEventListener("input", paint);
+  paint();
 }

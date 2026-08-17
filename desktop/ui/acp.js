@@ -322,6 +322,12 @@ export class AgentClient {
   hookAction(sessionId, action) {
     return this.ext("x.ai/hooks/action", { sessionId, action });
   }
+  marketplaceList() {
+    return this.ext("x.ai/marketplace/list", {});
+  }
+  marketplaceAction(sessionId, action) {
+    return this.ext("x.ai/marketplace/action", { sessionId, action });
+  }
 
   _sessionMeta(meta = {}) {
     const out = { ...meta };

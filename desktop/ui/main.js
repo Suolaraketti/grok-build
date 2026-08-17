@@ -2873,6 +2873,7 @@ function desktopCommands() {
     { name: "flush memory", desc: "Save session knowledge now", run: () => runSessionAction("flush", state.activeChat) },
     { name: "settings", desc: "Agent settings", run: () => openSettings() },
     { name: "extensions", desc: "Skills, MCP, plugins, hooks", run: () => openStudio("skills") },
+    { name: "marketplace", desc: "Browse and install plugins", run: () => openStudio("market") },
     { name: "mcp", desc: "MCP servers", run: () => openStudio("mcp") },
     { name: "inspect", desc: "Session info and context", run: () => toggleInspector() },
     { name: "docs", desc: "Open Grok Build documentation", run: () => openExternal("https://docs.x.ai/build/overview") },
@@ -3084,6 +3085,8 @@ initStudio({
   toast,
   friendlyRpcError,
   openExternal,
+  askText,
+  askConfirm,
 });
 applyTheme(prefs.theme);
 

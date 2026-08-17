@@ -12,7 +12,7 @@
 
 "use strict";
 
-export const DESKTOP_VERSION = "1.3.0";
+export const DESKTOP_VERSION = "1.4.0";
 export const CLIENT_INFO_NAME = "grok-build-desktop";
 
 // Wire name the agent deserializes as ClientType::Desktop (underscore).
