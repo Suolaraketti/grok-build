@@ -129,6 +129,9 @@
         <div id="model-menu" class="menu-pop hidden"></div>
         <button id="chat-more-btn" class="chip" title="Session actions" type="button">More</button>
         <div id="chat-more-menu" class="menu-pop hidden"></div>
+        <button id="studio-btn" class="chip" title="Skills, MCP, plugins, hooks" type="button">Extensions</button>
+        <button id="inspect-btn" class="chip" title="Session info, context, subagents" type="button">Inspect</button>
+        <button id="docs-btn" class="chip" title="Open Grok Build docs" type="button">Docs</button>
         <button id="palette-btn" class="chip" title="Command palette (Ctrl+K)" type="button">Ctrl+K</button>
       </header>
 
@@ -185,7 +188,10 @@
             <div id="composer-hint" class="muted small">Enter to send · Shift+Enter newline · Ctrl+K commands · ↑ history</div>
           </div>
         </section>
-        <aside id="right-rail" class="hidden" hidden aria-label="Inspector"></aside>
+        <aside id="right-rail" class="hidden" hidden aria-label="Inspector">
+          <div class="insp-head">Inspector</div>
+          <div id="inspector-body" class="insp-body"></div>
+        </aside>
       </div>
     </main>
   </div>
@@ -231,6 +237,14 @@
           <option value="medium">Medium</option>
           <option value="high">High</option>
           <option value="xhigh">Extra high</option>
+        </select>
+      </label>
+      <label class="field">
+        <span>Appearance</span>
+        <select id="set-theme">
+          <option value="system">Match system</option>
+          <option value="dark">Dark</option>
+          <option value="light">Light</option>
         </select>
       </label>
       <label class="check">
@@ -280,6 +294,25 @@
       </div>
       <div id="agent-prompt-body"></div>
       <div id="agent-prompt-options" class="perm-options"></div>
+    </div>
+  </div>
+
+  <div id="studio-overlay" class="overlay hidden" role="dialog" aria-modal="true">
+    <div class="modal studio-modal">
+      <div class="modal-head">
+        <h2>Extensions</h2>
+        <p class="muted small">Same catalogs the TUI uses: skills, MCP, plugins, hooks.</p>
+      </div>
+      <div id="studio-tabs" class="studio-tabs">
+        <button type="button" class="mode-btn active" data-tab="skills">Skills</button>
+        <button type="button" class="mode-btn" data-tab="mcp">MCP</button>
+        <button type="button" class="mode-btn" data-tab="plugins">Plugins</button>
+        <button type="button" class="mode-btn" data-tab="hooks">Hooks</button>
+      </div>
+      <div id="studio-body" class="studio-body"></div>
+      <div class="perm-options">
+        <button id="studio-close" class="btn btn-primary" type="button">Done</button>
+      </div>
     </div>
   </div>
 

@@ -27,6 +27,15 @@ test("empty-state overlay fills the transcript pane only", () => {
   assert.doesNotMatch(css, /inset:\s*0\s+0\s+118px/);
 });
 
+test("1.3.0 studio and inspector chrome exists", () => {
+  assert.match(html, /id="studio-overlay"/);
+  assert.match(html, /id="studio-btn"/);
+  assert.match(html, /id="inspect-btn"/);
+  assert.match(html, /id="inspector-body"/);
+  assert.match(html, /id="set-theme"/);
+  assert.match(html, /data-tab="mcp"/);
+});
+
 test("1.2.0 chrome for attach, palette, effort, and rewind exists", () => {
   assert.match(html, /id="attach-btn"/);
   assert.match(html, /id="palette-overlay"/);

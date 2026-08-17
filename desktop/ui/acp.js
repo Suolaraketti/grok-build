@@ -288,6 +288,40 @@ export class AgentClient {
   listWorkflows(sessionId) {
     return this.ext("x.ai/workflows/list", { sessionId: sessionId || undefined });
   }
+  listMcp(sessionId) {
+    return this.ext("x.ai/mcp/list", { sessionId: sessionId || undefined });
+  }
+  toggleMcp(sessionId, serverName, enabled) {
+    return this.ext("x.ai/mcp/toggle", {
+      session_id: sessionId,
+      server_name: serverName,
+      enabled: !!enabled,
+    });
+  }
+  sessionInfo(sessionId) {
+    return this.ext("x.ai/session/info", { sessionId });
+  }
+  sessionState(sessionId, cwd) {
+    return this.ext("x.ai/session/state", { sessionId, cwd });
+  }
+  listSubagents(sessionId) {
+    return this.ext("x.ai/subagent/list_running", { sessionId });
+  }
+  cancelSubagent(subagentId) {
+    return this.ext("x.ai/subagent/cancel", { subagentId });
+  }
+  listWorktrees() {
+    return this.ext("x.ai/git/worktree/list", { include_all: true });
+  }
+  toggleSkill(name, enabled, cwd) {
+    return this.ext("x.ai/skills/toggle", { name, enabled: !!enabled, cwd: cwd || undefined });
+  }
+  pluginAction(sessionId, action) {
+    return this.ext("x.ai/plugins/action", { sessionId, action });
+  }
+  hookAction(sessionId, action) {
+    return this.ext("x.ai/hooks/action", { sessionId, action });
+  }
 
   _sessionMeta(meta = {}) {
     const out = { ...meta };

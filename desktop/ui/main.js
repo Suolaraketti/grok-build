@@ -11,6 +11,7 @@ import { AgentClient, METHOD, agentBinaryInfo, pickFolder, homeDir, listStoredSe
 import { createMdStream, updateMdStream } from "./markdown.js";
 import { unifiedLineDiff } from "./diff.js";
 import { friendlyRpcError, EFFORT_LEVELS, normalizeEffort } from "./protocol.js";
+import { initStudio, openStudio, closeStudio, toggleInspector, refreshInspector, applyTheme } from "./studio.js";
 
 const $ = (id) => document.getElementById(id);
 const client = new AgentClient();
@@ -31,6 +32,11 @@ const prefs = {
   },
   get privacyOptOut() { return localStorage.getItem("grok.privacyOptOut") === "1"; },
   set privacyOptOut(v) { localStorage.setItem("grok.privacyOptOut", v ? "1" : "0"); },
+  get theme() { return localStorage.getItem("grok.theme") || "system"; },
+  set theme(v) {
+    const t = v === "light" || v === "dark" ? v : "system";
+    localStorage.setItem("grok.theme", t);
+  },
   get mode() { return localStorage.getItem("grok.mode") || "default"; },
   set mode(v) {
     const id = v === "ask" || v === "plan" ? v : "default";
@@ -438,6 +444,7 @@ function openSettings() {
   $("set-model").value = prefs.model;
   $("set-effort").value = prefs.effort;
   $("set-privacy").checked = prefs.privacyOptOut;
+  $("set-theme").value = prefs.theme;
   $("settings-overlay").classList.remove("hidden");
 }
 
@@ -459,6 +466,8 @@ function closeSettings(apply) {
   prefs.model = nextModel;
   prefs.effort = nextEffort;
   prefs.privacyOptOut = nextPrivacy;
+  const nextTheme = $("set-theme").value;
+  if (nextTheme !== prefs.theme) applyTheme(nextTheme);
   updateEffortLabel();
   pushPermissionMode();
   if (privacyChanged) {
@@ -753,6 +762,7 @@ function switchChat(chat) {
   stickToBottom = true;
   maybeScroll();
   loadPromptHistory();
+  refreshInspector();
   $("prompt-input").focus();
 }
 
@@ -2443,6 +2453,9 @@ document.addEventListener("keydown", (e) => {
   if (e.key === "Escape" && !$("rewind-overlay").classList.contains("hidden")) {
     $("rewind-overlay").classList.add("hidden");
   }
+  if (e.key === "Escape" && !$("studio-overlay").classList.contains("hidden")) {
+    closeStudio();
+  }
 });
 
 function sessionCreateMeta() {
@@ -2859,6 +2872,10 @@ function desktopCommands() {
     { name: "delete chat", desc: "Delete the current chat", run: () => runSessionAction("delete", state.activeChat) },
     { name: "flush memory", desc: "Save session knowledge now", run: () => runSessionAction("flush", state.activeChat) },
     { name: "settings", desc: "Agent settings", run: () => openSettings() },
+    { name: "extensions", desc: "Skills, MCP, plugins, hooks", run: () => openStudio("skills") },
+    { name: "mcp", desc: "MCP servers", run: () => openStudio("mcp") },
+    { name: "inspect", desc: "Session info and context", run: () => toggleInspector() },
+    { name: "docs", desc: "Open Grok Build documentation", run: () => openExternal("https://docs.x.ai/build/overview") },
     { name: "usage", desc: "Usage and credits", run: () => $("usage-btn").click() },
     { name: "skills", desc: "List installed skills", run: () => listExt("skills", () => client.listSkills(state.folder || state.activeChat?.folder)) },
     { name: "plugins", desc: "List installed plugins", run: () => listExt("plugins", () => client.listPlugins(state.activeChat?.sessionId)) },
@@ -3058,5 +3075,16 @@ function copyFromButton(btn) {
     }, 1200);
   });
 }
+
+initStudio({
+  client,
+  getState: () => state,
+  getPrefs: () => prefs,
+  setPref: (k, v) => { prefs[k] = v; },
+  toast,
+  friendlyRpcError,
+  openExternal,
+});
+applyTheme(prefs.theme);
 
 boot();
