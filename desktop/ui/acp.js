@@ -10,11 +10,16 @@
 
 import {
   rpcIdKey,
+  rpcErrorText,
   unwrapAgentRequest,
   isPermissionMethod,
   isFolderTrustMethod,
   isExitPlanMethod,
   isAskUserQuestionMethod,
+  DESKTOP_VERSION,
+  CLIENT_INFO_NAME,
+  CLIENT_TYPE,
+  CLIENT_IDENTIFIER,
 } from "./protocol.js";
 
 const { invoke } = window.__TAURI__.core;
@@ -85,12 +90,14 @@ export class AgentClient {
         fs: { readTextFile: false, writeTextFile: false },
         terminal: false,
       },
-      clientInfo: { name: "grok-build-desktop", version: "1.1.1" },
+      clientInfo: { name: CLIENT_INFO_NAME, version: DESKTOP_VERSION },
       _meta: {
-        // Wire name the agent deserializes as ClientType::Desktop (underscore).
-        clientType: "grok_desktop",
-        clientIdentifier: "grok-desktop",
-        clientVersion: "1.1.1",
+        // Desktop permission UX (folder trust, plan, ask-user-question).
+        clientType: CLIENT_TYPE,
+        // Sampling User-Agent must be the shipping CLI product, not the
+        // waitlisted official grok-desktop app (403 "coming soon").
+        clientIdentifier: CLIENT_IDENTIFIER,
+        clientVersion: DESKTOP_VERSION,
       },
     });
     this.authMethods = this.initializeResult.authMethods || [];
@@ -172,7 +179,7 @@ export class AgentClient {
 
   // Notification (no response). The shell flips session yolo/auto flags.
   yoloModeChanged({ yoloMode, autoMode, permissionMode } = {}) {
-    const params = { clientIdentifier: "grok-desktop" };
+    const params = { clientIdentifier: CLIENT_IDENTIFIER };
     if (yoloMode !== undefined) params.yolo_mode = !!yoloMode;
     if (autoMode !== undefined) params.auto_mode = !!autoMode;
     if (permissionMode) params.permission_mode = permissionMode;
@@ -268,7 +275,9 @@ export class AgentClient {
       if (!p) return;
       this.pending.delete(key);
       if (msg.error) {
-        const err = new Error(msg.error.message || "agent error");
+        const err = new Error(
+          rpcErrorText({ message: msg.error.message, data: msg.error.data }) || "agent error"
+        );
         err.code = msg.error.code;
         err.data = msg.error.data;
         p.reject(err);

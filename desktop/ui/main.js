@@ -10,6 +10,7 @@
 import { AgentClient, METHOD, agentBinaryInfo, pickFolder, homeDir, listStoredSessions, openExternal } from "./acp.js";
 import { createMdStream, updateMdStream } from "./markdown.js";
 import { unifiedLineDiff } from "./diff.js";
+import { friendlyRpcError } from "./protocol.js";
 
 const $ = (id) => document.getElementById(id);
 const client = new AgentClient();
@@ -1374,11 +1375,12 @@ client.onSessionNotification = (params) => {
         setTurnStatus(chat, null);
       } else if (update.type === "failed") {
         const authy = update.error_type === "auth" || update.errorType === "auth";
+        const raw = update.message || "The request failed.";
         appendErrorNote(
           chat,
           authy
-            ? `${update.message || "Authentication failed."}\n\nSign out and back in from the account menu.`
-            : update.message || "The request failed."
+            ? `${raw}\n\nSign out and back in from the account menu.`
+            : friendlyRpcError({ message: raw })
         );
         setTurnStatus(chat, null);
       }
@@ -1409,9 +1411,13 @@ function shortReason(reason) {
 }
 
 function appendErrorNote(chat, msg) {
+  const text = String(msg || "").trim();
+  if (!text) return;
+  if (chat.lastErrorNote === text) return;
+  chat.lastErrorNote = text;
   const note = document.createElement("div");
   note.className = "error-note";
-  note.textContent = msg;
+  note.textContent = text;
   (chat.turn?.container || chat.el).appendChild(note);
   maybeScroll();
 }
@@ -2180,6 +2186,7 @@ async function sendPrompt() {
   addUserMessage(chat, text);
   beginTurn(chat);
   chat.busy = true;
+  chat.lastErrorNote = null;
   updateComposer();
 
   try {
@@ -2188,22 +2195,11 @@ async function sendPrompt() {
     });
     addUsage(chat, result?._meta?.usage);
   } catch (err) {
-    const note = document.createElement("div");
-    note.className = "error-note";
-    note.textContent = friendlyError(err);
-    (chat.turn?.container || chat.el).appendChild(note);
+    appendErrorNote(chat, friendlyRpcError(err));
   } finally {
     endTurn(chat);
     maybeScroll();
   }
-}
-
-function friendlyError(err) {
-  const msg = String((err && err.message) || err);
-  if (/auth|401|unauthor/i.test(msg)) {
-    return `${msg}\n\nYour session may have expired — sign out and back in from the account menu.`;
-  }
-  return msg;
 }
 
 function autosize(el) {
