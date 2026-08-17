@@ -426,6 +426,7 @@ input:focus, textarea:focus {
   padding: 9px 14px;
   border-bottom: 1px solid var(--border);
   position: relative;
+  flex-wrap: wrap;
 }
 .topbar-spacer { flex: 1; }
 
@@ -513,6 +514,20 @@ input:focus, textarea:focus {
 .msg-agent .md li { margin: 2px 0; }
 .msg-agent .md blockquote { border-left: 3px solid var(--border-strong); margin: 0 0 8px; padding: 2px 14px; color: var(--text-2); }
 .msg-agent .md hr { border: none; border-top: 1px solid var(--border); margin: 12px 0; }
+.msg-agent .md-table-wrap { overflow-x: auto; margin: 0 0 10px; }
+.msg-agent .md-table {
+  border-collapse: collapse;
+  width: 100%;
+  font-size: 13px;
+}
+.msg-agent .md-table th,
+.msg-agent .md-table td {
+  border: 1px solid var(--border);
+  padding: 6px 9px;
+  text-align: left;
+  vertical-align: top;
+}
+.msg-agent .md-table th { background: var(--bg-2); font-weight: 600; }
 
 pre {
   background: var(--bg-1);
@@ -700,7 +715,9 @@ details.thought .thought-body {
   width: 34px; height: 34px; border-radius: 10px;
   display: flex; align-items: center; justify-content: center;
   border: none; cursor: pointer; flex: none; transition: background 0.12s, opacity 0.12s;
+  background: var(--bg-3); color: var(--text-2);
 }
+.iconbtn:hover { color: var(--text); }
 .iconbtn-send { background: var(--accent); color: var(--accent-fg); }
 .iconbtn-send:hover { opacity: 0.88; }
 .iconbtn-send:disabled { opacity: 0.4; cursor: default; }
@@ -914,6 +931,68 @@ details.tool-call[open] > summary .tool-caret { transform: rotate(90deg); }
 
 /* composer disabled state */
 #composer-inner.disabled { opacity: 0.6; }
+
+.attach-strip {
+  display: flex; flex-wrap: wrap; gap: 6px;
+  padding: 0 4px 8px;
+}
+.attach-chip, .queue-chip {
+  display: inline-flex; align-items: center; gap: 6px;
+  background: var(--bg-2); border: 1px solid var(--border);
+  border-radius: 999px; padding: 3px 8px 3px 10px;
+  font-size: 12px; color: var(--text-2); max-width: 240px;
+}
+.attach-chip img { width: 22px; height: 22px; object-fit: cover; border-radius: 4px; }
+.attach-chip button, .queue-chip button {
+  appearance: none; background: none; border: none; color: var(--text-3);
+  cursor: pointer; font-size: 14px; line-height: 1; padding: 0 2px;
+}
+.attach-chip button:hover, .queue-chip button:hover { color: var(--danger); }
+
+.palette-modal { width: min(560px, calc(100vw - 32px)); padding-top: 14px; }
+#palette-input {
+  width: 100%; background: var(--bg-2); border: 1px solid var(--border-strong);
+  color: var(--text); border-radius: var(--radius-sm); padding: 10px 12px;
+  font: inherit; outline: none;
+}
+#palette-input:focus { border-color: var(--brand); }
+.palette-list { margin-top: 10px; max-height: 360px; overflow-y: auto; }
+.palette-item {
+  display: flex; flex-direction: column; gap: 2px;
+  width: 100%; text-align: left; background: none; border: none;
+  color: var(--text); padding: 8px 10px; border-radius: var(--radius-sm);
+  cursor: pointer; font-family: inherit;
+}
+.palette-item.active, .palette-item:hover { background: var(--bg-3); }
+.palette-item .pk { font-size: 13px; font-weight: 600; }
+.palette-item .pd { font-size: 12px; color: var(--text-3); }
+.palette-hint { margin: 10px 0 0; }
+
+.rewind-list { display: flex; flex-direction: column; gap: 6px; max-height: 360px; overflow-y: auto; }
+.rewind-item {
+  display: flex; flex-direction: column; gap: 2px;
+  width: 100%; text-align: left; background: var(--bg-2);
+  border: 1px solid var(--border); border-radius: var(--radius-sm);
+  color: var(--text); padding: 9px 11px; cursor: pointer; font-family: inherit;
+}
+.rewind-item:hover { border-color: var(--brand); }
+.rewind-item .rw-preview { font-size: 13px; }
+.rewind-item .rw-meta { font-size: 11px; color: var(--text-3); }
+
+.chat-item { position: relative; padding-right: 28px; }
+.chat-item .chat-kebab {
+  position: absolute; right: 4px; top: 50%; transform: translateY(-50%);
+  appearance: none; background: none; border: none; color: var(--text-3);
+  cursor: pointer; padding: 2px 6px; border-radius: 6px; font-size: 14px;
+  font-family: inherit; line-height: 1;
+}
+.chat-item .chat-kebab:hover { background: var(--bg-3); color: var(--text); }
+
+select {
+  width: 100%; background: var(--bg-2); border: 1px solid var(--border);
+  color: var(--text); border-radius: var(--radius-sm); padding: 8px 10px;
+  font: inherit;
+}
 
 .ask-list { display: flex; flex-direction: column; gap: 14px; }
 .ask-q { display: flex; flex-direction: column; gap: 8px; }

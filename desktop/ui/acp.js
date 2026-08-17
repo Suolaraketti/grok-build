@@ -20,6 +20,7 @@ import {
   CLIENT_INFO_NAME,
   CLIENT_TYPE,
   CLIENT_IDENTIFIER,
+  unwrapExtResult,
 } from "./protocol.js";
 
 const { invoke } = window.__TAURI__.core;
@@ -124,43 +125,44 @@ export class AgentClient {
     return await this.request("session/new", {
       cwd,
       mcpServers: [],
-      _meta: meta,
+      _meta: this._sessionMeta(meta),
     });
   }
 
   // Restore a stored session for continuation. The agent replays the whole
   // transcript as session/update notifications BEFORE this resolves, so the
   // caller must be ready to route updates for this sessionId when calling.
-  async loadSession(sessionId, cwd) {
-    return await this.request("session/load", { sessionId, cwd, mcpServers: [] });
+  async loadSession(sessionId, cwd, meta = {}) {
+    const params = { sessionId, cwd, mcpServers: [] };
+    const cleaned = this._sessionMeta(meta);
+    if (Object.keys(cleaned).length) params._meta = cleaned;
+    return await this.request("session/load", params);
   }
 
   // Official Aug 4: first-class resume. Fall back to session/load on older agents.
-  async resumeSession(sessionId, cwd) {
+  async resumeSession(sessionId, cwd, meta = {}) {
+    const params = { sessionId, cwd, mcpServers: [] };
+    const cleaned = this._sessionMeta(meta);
+    if (Object.keys(cleaned).length) params._meta = cleaned;
     try {
-      return await this.request("session/resume", { sessionId, cwd, mcpServers: [] });
+      return await this.request("session/resume", params);
     } catch (err) {
       const msg = String((err && err.message) || err);
       if (/method not found|unknown|not supported|invalid/i.test(msg)) {
-        return await this.loadSession(sessionId, cwd);
+        return await this.loadSession(sessionId, cwd, meta);
       }
       throw err;
     }
   }
 
-  async prompt(sessionId, text, meta = {}) {
-    const params = {
-      sessionId,
-      prompt: [{ type: "text", text }],
-    };
-    // Only stamp _meta when there is a real mode/promptId — sending
-    // `{ mode: "default" }` on every turn is noise and some agents treat
-    // unknown mode strings more strictly than PromptMode::from_meta_str.
-    const cleaned = {};
-    if (meta && typeof meta === "object") {
-      if (meta.mode && meta.mode !== "default") cleaned.mode = meta.mode;
-      if (meta.promptId) cleaned.promptId = meta.promptId;
-    }
+  // `blocks` is an optional ACP ContentBlock[] (text + image). When omitted
+  // we send a single text block, matching 1.1.x.
+  async prompt(sessionId, text, meta = {}, blocks = null) {
+    const prompt = Array.isArray(blocks) && blocks.length
+      ? blocks
+      : [{ type: "text", text }];
+    const params = { sessionId, prompt };
+    const cleaned = this._promptMeta(meta);
     if (Object.keys(cleaned).length) params._meta = cleaned;
     return await this.request("session/prompt", params);
   }
@@ -169,8 +171,10 @@ export class AgentClient {
     this._send({ jsonrpc: "2.0", method: "session/cancel", params: { sessionId } });
   }
 
-  async setModel(sessionId, modelId) {
-    return await this.request("session/set_model", { sessionId, modelId });
+  async setModel(sessionId, modelId, effort = "") {
+    const params = { sessionId, modelId };
+    if (effort) params._meta = { reasoningEffort: effort };
+    return await this.request("session/set_model", params);
   }
 
   async setMode(sessionId, modeId) {
@@ -209,20 +213,7 @@ export class AgentClient {
 
   async ext(method, params = {}) {
     const result = await this.request(`_${method}`, params);
-    return this._unwrapExt(result);
-  }
-
-  _unwrapExt(result) {
-    if (result == null) return {};
-    // Flatten the ExtMethodResult `{ result: <payload> }` envelope when present.
-    if (
-      typeof result === "object" &&
-      result.result !== undefined &&
-      Object.keys(result).length === 1
-    ) {
-      return result.result ?? {};
-    }
-    return result;
+    return unwrapExtResult(result);
   }
 
   authInfo() { return this.ext("x.ai/auth/info"); }
@@ -231,6 +222,87 @@ export class AgentClient {
   setApiKey(key) { return this.ext("x.ai/setApiKey", { key }); }
   logout(scope) { return this.ext("x.ai/auth/logout", { scope: scope ?? null }); }
   billing() { return this.ext("x.ai/billing", {}); }
+
+  renameSession(sessionId, title, cwd) {
+    return this.ext("x.ai/session/rename", { sessionId, title, cwd: cwd || undefined });
+  }
+  deleteSession(sessionId, cwd) {
+    return this.ext("x.ai/session/delete", { sessionId, cwd: cwd || undefined });
+  }
+  forkSession(sourceSessionId, sourceCwd, newCwd) {
+    return this.ext("x.ai/session/fork", {
+      sourceSessionId,
+      sourceCwd,
+      newCwd: newCwd || sourceCwd,
+    });
+  }
+  sessionUsage(sessionId) {
+    return this.ext("x.ai/session/usage", { sessionId });
+  }
+  rewindPoints(sessionId) {
+    return this.ext("x.ai/rewind/points", { sessionId });
+  }
+  rewindTo(sessionId, targetPromptIndex, { force = false } = {}) {
+    return this.ext("x.ai/rewind/execute", { sessionId, targetPromptIndex, force });
+  }
+  compactConversation(sessionId, userContext) {
+    return this.ext("x.ai/compact_conversation", {
+      sessionId,
+      userContext: userContext || undefined,
+    });
+  }
+  interject(sessionId, text, content) {
+    const params = { sessionId, text };
+    if (content) params.content = content;
+    return this.ext("x.ai/interject", params);
+  }
+  btw(sessionId, question) {
+    return this.ext("x.ai/btw", { sessionId, question });
+  }
+  promptHistory(cwd, filterSessionId) {
+    return this.ext("x.ai/prompt_history", {
+      cwd,
+      filter_session_id: filterSessionId || undefined,
+    });
+  }
+  memoryFlush(sessionId) {
+    return this.ext("x.ai/memory/flush", { session_id: sessionId });
+  }
+  listCommands(sessionId) {
+    return this.ext("x.ai/commands/list", sessionId ? { sessionId } : {});
+  }
+  setPrivacyRetention(optOut) {
+    return this.ext("x.ai/privacy/setCodingDataRetention", {
+      codingDataRetentionOptOut: !!optOut,
+    });
+  }
+  listSkills(cwd) {
+    return this.ext("x.ai/skills/list", { cwd: cwd || undefined });
+  }
+  listPlugins(sessionId) {
+    return this.ext("x.ai/plugins/list", { sessionId: sessionId || undefined });
+  }
+  listHooks(sessionId) {
+    return this.ext("x.ai/hooks/list", { sessionId: sessionId || undefined });
+  }
+  listWorkflows(sessionId) {
+    return this.ext("x.ai/workflows/list", { sessionId: sessionId || undefined });
+  }
+
+  _sessionMeta(meta = {}) {
+    const out = { ...meta };
+    if (meta.reasoningEffort) out.reasoningEffort = meta.reasoningEffort;
+    return out;
+  }
+
+  _promptMeta(meta = {}) {
+    const cleaned = {};
+    if (meta && typeof meta === "object") {
+      if (meta.mode && meta.mode !== "default") cleaned.mode = meta.mode;
+      if (meta.promptId) cleaned.promptId = meta.promptId;
+    }
+    return cleaned;
+  }
 
   // ---- transport ----
 

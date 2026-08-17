@@ -12,7 +12,7 @@
 
 "use strict";
 
-export const DESKTOP_VERSION = "1.1.2";
+export const DESKTOP_VERSION = "1.2.0";
 export const CLIENT_INFO_NAME = "grok-build-desktop";
 
 // Wire name the agent deserializes as ClientType::Desktop (underscore).
@@ -21,6 +21,30 @@ export const CLIENT_TYPE = "grok_desktop";
 // Product token for User-Agent / x-grok-client-identifier. Must match the
 // shipping CLI (`grok-pager`), not official grok-desktop (still gated).
 export const CLIENT_IDENTIFIER = "grok-pager";
+
+// Official ACP `_meta.reasoningEffort` (xai-grok-sampling-types).
+export const REASONING_EFFORT_META_KEY = "reasoningEffort";
+export const EFFORT_LEVELS = ["low", "medium", "high", "xhigh"];
+
+export function normalizeEffort(v) {
+  const s = String(v || "").toLowerCase();
+  return EFFORT_LEVELS.includes(s) ? s : "";
+}
+
+/** Flatten official ExtMethodResult `{ result, error? }` without dropping a lone payload. */
+export function unwrapExtResult(result) {
+  if (result == null) return {};
+  if (typeof result !== "object" || Array.isArray(result)) return result;
+  if (result.result === undefined) return result;
+  const keys = Object.keys(result);
+  if (!keys.every((k) => k === "result" || k === "error")) return result;
+  if (result.error) {
+    const err = new Error(String(result.error));
+    err.data = result;
+    throw err;
+  }
+  return result.result ?? {};
+}
 
 /** Map key for a JSON-RPC id. Number `1` and string `"1"` must collide. */
 export function rpcIdKey(id) {

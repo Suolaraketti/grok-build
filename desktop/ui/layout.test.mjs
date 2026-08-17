@@ -27,6 +27,16 @@ test("empty-state overlay fills the transcript pane only", () => {
   assert.doesNotMatch(css, /inset:\s*0\s+0\s+118px/);
 });
 
+test("1.2.0 chrome for attach, palette, effort, and rewind exists", () => {
+  assert.match(html, /id="attach-btn"/);
+  assert.match(html, /id="palette-overlay"/);
+  assert.match(html, /id="effort-btn"/);
+  assert.match(html, /id="rewind-overlay"/);
+  assert.match(html, /id="set-auto"/);
+  assert.match(html, /id="set-effort"/);
+  assert.match(html, /Ctrl\+K/);
+});
+
 test("desktop initialize does not advertise waitlisted grok-desktop product", () => {
   const acp = readFileSync(join(dir, "acp.js"), "utf8");
   assert.match(acp, /clientIdentifier:\s*CLIENT_IDENTIFIER/);

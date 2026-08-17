@@ -45,6 +45,7 @@ use xai_grok_tools::types::tool::ToolKind;
 use xai_grok_workspace::file_system::AsyncFileSystem;
 use xai_hunk_tracker::HunkTrackerHandle;
 mod attempt_runner;
+mod attempt_store;
 mod handle_request;
 pub(crate) use handle_request::run_shell_child;
 /// How the child session's initial context was bootstrapped.

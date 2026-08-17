@@ -134,7 +134,6 @@ use super::PromptOrigin;
 use super::acp_types;
 use super::chat_persistence;
 use super::compaction_config;
-use super::helpers;
 use super::memory_state;
 use super::telemetry;
 #[path = "acp_session_impl/prompt_build.rs"]

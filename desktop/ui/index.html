@@ -117,11 +117,19 @@
         <button id="usage-btn" class="chip" title="Usage &amp; credits">
           <span id="usage-label">Usage</span>
         </button>
+        <button id="effort-btn" class="chip" title="Reasoning effort">
+          <span id="effort-label">Effort</span>
+          <svg viewBox="0 0 16 16" width="12" height="12" aria-hidden="true"><path fill="currentColor" d="M4.5 6.5 8 10l3.5-3.5"/></svg>
+        </button>
+        <div id="effort-menu" class="menu-pop hidden"></div>
         <button id="model-btn" class="chip" title="Model">
           <span id="model-label">Default model</span>
           <svg viewBox="0 0 16 16" width="12" height="12" aria-hidden="true"><path fill="currentColor" d="M4.5 6.5 8 10l3.5-3.5"/></svg>
         </button>
         <div id="model-menu" class="menu-pop hidden"></div>
+        <button id="chat-more-btn" class="chip" title="Session actions" type="button">More</button>
+        <div id="chat-more-menu" class="menu-pop hidden"></div>
+        <button id="palette-btn" class="chip" title="Command palette (Ctrl+K)" type="button">Ctrl+K</button>
       </header>
 
       <div id="workspace">
@@ -156,7 +164,12 @@
                   <button type="button" class="mode-btn" data-mode="plan">Plan</button>
                 </div>
               </div>
+              <div id="attach-strip" class="attach-strip hidden"></div>
               <div class="composer-row">
+                <button id="attach-btn" class="iconbtn" type="button" title="Attach image or file" aria-label="Attach">
+                  <svg viewBox="0 0 16 16" width="15" height="15" aria-hidden="true"><path fill="currentColor" d="M8.7 2.4a2.6 2.6 0 0 1 3.7 3.7L6.8 11.7a1.6 1.6 0 1 1-2.3-2.3l5-5a.75.75 0 0 1 1.06 1.06l-5 5a.1.1 0 1 0 .18.18l5.6-5.6A1.1 1.1 0 1 0 9.8 4.5L4.2 10a2.6 2.6 0 1 0 3.7 3.7l5.6-5.6a.75.75 0 0 1 1.06 1.06l-5.6 5.6a4.1 4.1 0 1 1-5.8-5.8l5.6-5.6Z"/></svg>
+                </button>
+                <input id="attach-input" type="file" multiple hidden accept="image/*,.md,.txt,.json,.rs,.ts,.js,.py,.toml,.yml,.yaml" />
                 <textarea id="prompt-input" rows="1"
                   placeholder="Ask Grok to build, fix, or explain something…"></textarea>
                 <div class="composer-actions">
@@ -169,7 +182,7 @@
                 </div>
               </div>
             </div>
-            <div id="composer-hint" class="muted small">Enter to send · Shift+Enter for a new line</div>
+            <div id="composer-hint" class="muted small">Enter to send · Shift+Enter newline · Ctrl+K commands · ↑ history</div>
           </div>
         </section>
         <aside id="right-rail" class="hidden" hidden aria-label="Inspector"></aside>
@@ -200,13 +213,31 @@
       </div>
       <label class="check">
         <input id="set-yolo" type="checkbox" />
-        <span>Auto-approve tool actions <span class="muted">(skip permission prompts — use with care)</span></span>
+        <span>Always approve tool actions <span class="muted">(skip permission prompts — use with care)</span></span>
+      </label>
+      <label class="check">
+        <input id="set-auto" type="checkbox" />
+        <span>Auto permission mode <span class="muted">(approve safe tools; ask for dangerous ones)</span></span>
       </label>
       <label class="field">
         <span>Default model <span class="muted">(optional)</span></span>
-        <input id="set-model" type="text" placeholder="e.g. grok-build" spellcheck="false" />
+        <input id="set-model" type="text" placeholder="e.g. grok-4.6" spellcheck="false" />
       </label>
-      <p class="muted small">Changing the model or auto-approve restarts the agent and restores this chat.</p>
+      <label class="field">
+        <span>Reasoning effort</span>
+        <select id="set-effort">
+          <option value="">Model default</option>
+          <option value="low">Low</option>
+          <option value="medium">Medium</option>
+          <option value="high">High</option>
+          <option value="xhigh">Extra high</option>
+        </select>
+      </label>
+      <label class="check">
+        <input id="set-privacy" type="checkbox" />
+        <span>Opt out of coding-data retention / training</span>
+      </label>
+      <p class="muted small">Always-approve and model changes restart the agent and restore this chat. Effort applies to the next session or model switch.</p>
       <div class="perm-options">
         <button id="settings-close" class="btn btn-primary">Done</button>
       </div>
@@ -249,6 +280,28 @@
       </div>
       <div id="agent-prompt-body"></div>
       <div id="agent-prompt-options" class="perm-options"></div>
+    </div>
+  </div>
+
+  <div id="palette-overlay" class="overlay hidden" role="dialog" aria-modal="true">
+    <div class="modal palette-modal">
+      <input id="palette-input" type="text" placeholder="Search commands and slash actions…" spellcheck="false" />
+      <div id="palette-list" class="palette-list"></div>
+      <p class="muted small palette-hint">Type to filter · Enter to run · Esc to close</p>
+    </div>
+  </div>
+
+  <div id="rewind-overlay" class="overlay hidden" role="dialog" aria-modal="true">
+    <div class="modal">
+      <div class="modal-head">
+        <span class="modal-badge">Rewind</span>
+        <h2>Roll this chat back</h2>
+      </div>
+      <p class="muted small">Pick a user prompt. Everything after it is discarded. File snapshots revert when they exist.</p>
+      <div id="rewind-list" class="rewind-list"></div>
+      <div class="perm-options">
+        <button id="rewind-cancel" class="btn" type="button">Cancel</button>
+      </div>
     </div>
   </div>
 

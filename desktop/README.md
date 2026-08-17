@@ -27,6 +27,14 @@ Grok Build itself is a beta for **SuperGrok** and **X Premium+** (or an xAI
 API key). A free grok.com account can sign in, then the API returns 403
 ("coming soon" / no access) until the account is eligible.
 
+Desktop **1.2.0** talks to official grok **1.0.5** ACP extensions: images and
+file attach, mid-turn steering, prompt history, reasoning effort, rewind,
+compact, fork, rename/delete, export, auto permission mode, and a command
+palette (Ctrl+K) for slash commands plus session actions. Agent-side skills,
+plugins, hooks, and workflows still load from `~/.grok`; the palette can
+list them. Full TUI chrome (themes, mermaid, voice, dashboard peek) is not
+rebuilt here.
+
 ## How it works
 
 The app does **not** reimplement the agent. It is a thin

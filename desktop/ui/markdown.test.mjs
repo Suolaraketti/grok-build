@@ -23,6 +23,13 @@ test("keeps fenced code as a single block", () => {
   assert.match(html, /data-copy="pre"/);
 });
 
+test("renders pipe tables", () => {
+  const html = renderMarkdown("| A | B |\n| --- | --- |\n| 1 | 2 |");
+  assert.match(html, /<table class="md-table">/);
+  assert.match(html, /<th>A<\/th>/);
+  assert.match(html, /<td>1<\/td>/);
+});
+
 test("joins consecutive list items", () => {
   const html = renderMarkdown("- a\n- b\n- c");
   assert.equal((html.match(/<ul>/g) || []).length, 1);

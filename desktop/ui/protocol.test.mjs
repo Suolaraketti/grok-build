@@ -11,6 +11,9 @@ import {
   isAskUserQuestionMethod,
   CLIENT_TYPE,
   CLIENT_IDENTIFIER,
+  normalizeEffort,
+  REASONING_EFFORT_META_KEY,
+  unwrapExtResult,
 } from "./protocol.js";
 
 test("rpc ids coerce number and string to the same map key", () => {
@@ -48,6 +51,19 @@ test("classifies desktop reverse-request methods", () => {
   assert.equal(isExitPlanMethod("x.ai/exit_plan_mode"), true);
   assert.equal(isAskUserQuestionMethod("x.ai/ask_user_question"), true);
   assert.equal(isPermissionMethod("session/prompt"), false);
+});
+
+test("unwrapExtResult flattens official envelopes and surfaces error", () => {
+  assert.deepEqual(unwrapExtResult({ result: { status: "queued" } }), { status: "queued" });
+  assert.deepEqual(unwrapExtResult({ rewind_points: [] }), { rewind_points: [] });
+  assert.throws(() => unwrapExtResult({ result: {}, error: "nope" }), /nope/);
+});
+
+test("reasoning effort normalizes official levels", () => {
+  assert.equal(REASONING_EFFORT_META_KEY, "reasoningEffort");
+  assert.equal(normalizeEffort("HIGH"), "high");
+  assert.equal(normalizeEffort("xhigh"), "xhigh");
+  assert.equal(normalizeEffort("nope"), "");
 });
 
 test("API identity is the shipping CLI, not waitlisted grok-desktop", () => {

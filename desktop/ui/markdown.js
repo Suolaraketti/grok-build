@@ -69,13 +69,37 @@ function isListItem(line) {
   return isUl(line) || isOl(line);
 }
 
+function isTableSep(line) {
+  return /^\s*\|?[\s:|-]+\|[\s:|-]+\|?\s*$/.test(line) && /\|/.test(line) && /---/.test(line);
+}
+
+function isTableRow(line) {
+  return /^\s*\|.*\|\s*$/.test(line) || (/\|/.test(line) && isTableSep(line));
+}
+
+function splitTableCells(line) {
+  let s = String(line).trim();
+  if (s.startsWith("|")) s = s.slice(1);
+  if (s.endsWith("|")) s = s.slice(0, -1);
+  return s.split("|").map((c) => c.trim());
+}
+
+function renderTable(header, rows) {
+  const th = header.map((c) => `<th>${renderInline(c)}</th>`).join("");
+  const body = rows
+    .map((r) => `<tr>${r.map((c) => `<td>${renderInline(c)}</td>`).join("")}</tr>`)
+    .join("");
+  return `<div class="md-table-wrap"><table class="md-table"><thead><tr>${th}</tr></thead><tbody>${body}</tbody></table></div>`;
+}
+
 function isBlockBoundary(line) {
   return (
     isFenceOpen(line) ||
     isHeading(line) ||
     isHr(line) ||
     isQuote(line) ||
-    isListItem(line)
+    isListItem(line) ||
+    isTableSep(line)
   );
 }
 
@@ -162,6 +186,26 @@ export function parseMarkdownBlocks(src) {
         type: "quote",
         html: `<blockquote>${qlines.map(renderInline).join("<br>")}</blockquote>`,
       });
+      continue;
+    }
+
+    if (
+      i + 1 < lines.length &&
+      /\|/.test(line) &&
+      isTableSep(lines[i + 1])
+    ) {
+      const header = splitTableCells(line);
+      i += 2;
+      const rows = [];
+      while (i < lines.length && /\|/.test(lines[i]) && !isFenceOpen(lines[i]) && lines[i].trim()) {
+        if (isTableSep(lines[i])) {
+          i++;
+          continue;
+        }
+        rows.push(splitTableCells(lines[i]));
+        i++;
+      }
+      blocks.push({ type: "table", html: renderTable(header, rows) });
       continue;
     }
 
